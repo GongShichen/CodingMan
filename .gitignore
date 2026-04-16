@@ -1,1 +1,14 @@
-.omx/
+xsbin/
+bin/
+dist/
+coverage.out
+*.test
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+config.json
+.idea/*.iml
+.idea/modules.xml
+.idea/workspace.xml
