@@ -55,6 +55,7 @@ func (l *OpenAILLM) Chat(ctx context.Context, messages []Message, opts ChatOptio
 		InputTokens:  int(resp.Usage.InputTokens),
 		OutputTokens: int(resp.Usage.OutputTokens),
 		StopReason:   string(resp.Status),
+		ToolUses:     extractOpenAIToolUses(resp.Output),
 		Raw:          resp,
 	}, nil
 }
@@ -169,36 +170,71 @@ func buildOpenAIResponseParams(messages []Message, opts ChatOptions) (responses.
 	}
 
 	for _, message := range messages {
-		convertedMessage, err := toOpenAIMessage(message)
+		convertedMessages, err := toOpenAIInputItems(message)
 		if err != nil {
 			return responses.ResponseNewParams{}, err
 		}
-		params.Input.OfInputItemList = append(params.Input.OfInputItemList, convertedMessage)
+		params.Input.OfInputItemList = append(params.Input.OfInputItemList, convertedMessages...)
 	}
 
 	return params, nil
 }
 
-func toOpenAIMessage(message Message) (responses.ResponseInputItemUnionParam, error) {
+func toOpenAIInputItems(message Message) ([]responses.ResponseInputItemUnionParam, error) {
 	role := message.Role
 	if role == "" {
-		return responses.ResponseInputItemUnionParam{}, errors.New("message role is required")
+		return nil, errors.New("message role is required")
 	}
 
-	content, err := toOpenAIContentList(message.Content)
-	if err != nil {
-		return responses.ResponseInputItemUnionParam{}, err
+	items := make([]responses.ResponseInputItemUnionParam, 0, len(message.Content))
+	messageBlocks := make([]ContentBlock, 0, len(message.Content))
+	flushMessage := func() error {
+		if len(messageBlocks) == 0 {
+			return nil
+		}
+		content, err := toOpenAIContentList(messageBlocks)
+		if err != nil {
+			return err
+		}
+		switch strings.ToLower(role) {
+		case "user", "assistant", "system", "developer":
+			items = append(items, responses.ResponseInputItemParamOfMessage(
+				content,
+				responses.EasyInputMessageRole(strings.ToLower(role)),
+			))
+		default:
+			return fmt.Errorf("unsupported openai message role: %s", role)
+		}
+		messageBlocks = messageBlocks[:0]
+		return nil
 	}
 
-	switch strings.ToLower(role) {
-	case "user", "assistant", "system", "developer":
-		return responses.ResponseInputItemParamOfMessage(
-			content,
-			responses.EasyInputMessageRole(strings.ToLower(role)),
-		), nil
-	default:
-		return responses.ResponseInputItemUnionParam{}, fmt.Errorf("unsupported openai message role: %s", role)
+	for _, block := range message.Content {
+		switch block.Type {
+		case ContentTypeToolUse:
+			if err := flushMessage(); err != nil {
+				return nil, err
+			}
+			if block.ToolID == "" || block.ToolName == "" {
+				return nil, errors.New("tool_use block requires tool id and name")
+			}
+			items = append(items, responses.ResponseInputItemParamOfFunctionCall(block.ToolInput, block.ToolID, block.ToolName))
+		case ContentTypeToolResult:
+			if err := flushMessage(); err != nil {
+				return nil, err
+			}
+			if block.ToolID == "" {
+				return nil, errors.New("tool_result block requires tool id")
+			}
+			items = append(items, responses.ResponseInputItemParamOfFunctionCallOutput(block.ToolID, block.Text))
+		default:
+			messageBlocks = append(messageBlocks, block)
+		}
 	}
+	if err := flushMessage(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func toOpenAIContentList(content any) (responses.ResponseInputMessageContentListParam, error) {
@@ -249,6 +285,21 @@ func toOpenAIContentBlock(block ContentBlock) (responses.ResponseInputContentUni
 	default:
 		return responses.ResponseInputContentUnionParam{}, fmt.Errorf("unsupported content block type: %s", block.Type)
 	}
+}
+
+func extractOpenAIToolUses(items []responses.ResponseOutputItemUnion) []ToolUse {
+	toolUses := make([]ToolUse, 0)
+	for _, item := range items {
+		if item.Type != "function_call" {
+			continue
+		}
+		toolUses = append(toolUses, ToolUse{
+			ID:    item.CallID,
+			Name:  item.Name,
+			Input: item.Arguments.OfString,
+		})
+	}
+	return toolUses
 }
 
 func toOpenAITool(tool Tool) (responses.ToolUnionParam, error) {

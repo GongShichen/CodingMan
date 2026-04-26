@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -53,6 +54,7 @@ func (l *AnthropicLLM) Chat(ctx context.Context, messages []Message, opts ChatOp
 		InputTokens:  int(resp.Usage.InputTokens),
 		OutputTokens: int(resp.Usage.OutputTokens),
 		StopReason:   string(resp.StopReason),
+		ToolUses:     extractAnthropicToolUses(resp.Content),
 		Raw:          resp,
 	}, nil
 }
@@ -256,6 +258,20 @@ func toAnthropicContentBlock(block ContentBlock) (anthropic.ContentBlockParamUni
 			return anthropic.ContentBlockParamUnion{}, errors.New("image block requires image url or data/media type")
 		}
 		return anthropic.NewImageBlockBase64(block.MediaType, block.Data), nil
+	case ContentTypeToolUse:
+		if block.ToolID == "" || block.ToolName == "" {
+			return anthropic.ContentBlockParamUnion{}, errors.New("tool_use block requires tool id and name")
+		}
+		var input any = map[string]any{}
+		if block.ToolInput != "" {
+			input = json.RawMessage(block.ToolInput)
+		}
+		return anthropic.NewToolUseBlock(block.ToolID, input, block.ToolName), nil
+	case ContentTypeToolResult:
+		if block.ToolID == "" {
+			return anthropic.ContentBlockParamUnion{}, errors.New("tool_result block requires tool id")
+		}
+		return anthropic.NewToolResultBlock(block.ToolID, block.Text, block.IsError), nil
 	default:
 		return anthropic.ContentBlockParamUnion{}, fmt.Errorf("unsupported content block type: %s", block.Type)
 	}
@@ -315,4 +331,20 @@ func extractAnthropicText(blocks []anthropic.ContentBlockUnion) string {
 	}
 
 	return builder.String()
+}
+
+func extractAnthropicToolUses(blocks []anthropic.ContentBlockUnion) []ToolUse {
+	toolUses := make([]ToolUse, 0)
+	for _, block := range blocks {
+		if block.Type != "tool_use" {
+			continue
+		}
+		toolUse := block.AsToolUse()
+		toolUses = append(toolUses, ToolUse{
+			ID:    toolUse.ID,
+			Name:  toolUse.Name,
+			Input: string(toolUse.Input),
+		})
+	}
+	return toolUses
 }

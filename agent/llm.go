@@ -23,14 +23,18 @@ type LLMResponse struct {
 	Content                   string
 	InputTokens, OutputTokens int
 	StopReason                string
+	ToolUses                  []ToolUse
+	RetryAttempts             int
 	Raw                       any
 }
 
 type ContentType string
 
 const (
-	ContentTypeText  ContentType = "text"
-	ContentTypeImage ContentType = "image"
+	ContentTypeText       ContentType = "text"
+	ContentTypeImage      ContentType = "image"
+	ContentTypeToolUse    ContentType = "tool_use"
+	ContentTypeToolResult ContentType = "tool_result"
 )
 
 type ContentBlock struct {
@@ -40,11 +44,29 @@ type ContentBlock struct {
 	MediaType string
 	ImageURL  string
 	ToolId    string
+	ToolID    string
+	ToolName  string
+	ToolInput string
+	IsError   bool
 }
 
 type Message struct {
 	Role    string
 	Content []ContentBlock
+}
+
+type ToolUse struct {
+	ID    string
+	Name  string
+	Input string
+}
+
+func (toolUse ToolUse) ToMap() map[string]any {
+	return map[string]any{
+		"id":        toolUse.ID,
+		"name":      toolUse.Name,
+		"arguments": toolUse.Input,
+	}
 }
 
 type Tool = tool.Tool
@@ -68,6 +90,26 @@ func ImageURLBlock(imageURL string) ContentBlock {
 	return ContentBlock{
 		Type:     ContentTypeImage,
 		ImageURL: imageURL,
+	}
+}
+
+func ToolUseBlock(id string, name string, input string) ContentBlock {
+	return ContentBlock{
+		Type:      ContentTypeToolUse,
+		ToolID:    id,
+		ToolId:    id,
+		ToolName:  name,
+		ToolInput: input,
+	}
+}
+
+func ToolResultBlock(toolID string, text string, isError bool) ContentBlock {
+	return ContentBlock{
+		Type:    ContentTypeToolResult,
+		Text:    text,
+		ToolID:  toolID,
+		ToolId:  toolID,
+		IsError: isError,
 	}
 }
 
