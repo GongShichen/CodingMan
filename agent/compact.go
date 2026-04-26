@@ -46,6 +46,8 @@ func CompactMessages(messages []Message, llm LLM, keepRecent int) []Message {
 type CompactOptions struct {
 	KeepRecentRounds int
 	ToolBudget       ToolBudget
+	Context          context.Context
+	ChatOptions      ChatOptions
 }
 
 func CompactMessagesWithOptions(messages []Message, llm LLM, options CompactOptions) []Message {
@@ -80,14 +82,18 @@ func CompactMessagesWithOptions(messages []Message, llm LLM, options CompactOpti
 		return appendSystemMessage(systemMessage, recentMessages)
 	}
 
-	resp, err := llm.Chat(context.Background(), []Message{
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	resp, err := llm.Chat(ctx, []Message{
 		{
 			Role: "user",
 			Content: []ContentBlock{
 				TextBlock(compactSummaryPrompt + "\n\n" + historyText),
 			},
 		},
-	}, ChatOptions{})
+	}, options.ChatOptions)
 	if err != nil || strings.TrimSpace(resp.Content) == "" {
 		return appendSystemMessage(systemMessage, otherMessages)
 	}

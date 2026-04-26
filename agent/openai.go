@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	openai "github.com/openai/openai-go/v3"
@@ -101,36 +103,7 @@ func (l *OpenAILLM) Stream(ctx context.Context, messages []Message, opts ChatOpt
 		defer close(ch)
 
 		if l.useChatCompletions {
-			resp, err := l.chatCompletions(ctx, messages, opts)
-			if err != nil {
-				ch <- StreamEvent{Err: err, Done: true}
-				return
-			}
-			if resp.Content != "" {
-				ch <- StreamEvent{Type: "text", Text: resp.Content}
-			}
-			for _, toolUse := range resp.ToolUses {
-				ch <- StreamEvent{
-					Type:       "tool_use",
-					ToolID:     toolUse.ID,
-					ToolCallID: toolUse.ID,
-					ToolName:   toolUse.Name,
-				}
-				ch <- StreamEvent{
-					Type:       "tool_use_end",
-					ToolID:     toolUse.ID,
-					ToolCallID: toolUse.ID,
-					ToolName:   toolUse.Name,
-					ToolInput:  toolUse.Input,
-				}
-			}
-			ch <- StreamEvent{
-				Type:              "usage",
-				InputTokens:       resp.InputTokens,
-				OutputTokens:      resp.OutputTokens,
-				CachedInputTokens: resp.CachedInputTokens,
-			}
-			ch <- StreamEvent{Done: true}
+			l.streamChatCompletions(ctx, messages, opts, ch)
 			return
 		}
 
@@ -237,11 +210,17 @@ func (l *OpenAILLM) log(traceID string, format string, args ...any) {
 }
 
 type chatCompletionRequest struct {
-	Model       string                  `json:"model"`
-	Messages    []chatCompletionMessage `json:"messages"`
-	Tools       []chatCompletionTool    `json:"tools,omitempty"`
-	MaxTokens   int64                   `json:"max_tokens,omitempty"`
-	Temperature *float64                `json:"temperature,omitempty"`
+	Model         string                       `json:"model"`
+	Messages      []chatCompletionMessage      `json:"messages"`
+	Tools         []chatCompletionTool         `json:"tools,omitempty"`
+	MaxTokens     int64                        `json:"max_tokens,omitempty"`
+	Temperature   *float64                     `json:"temperature,omitempty"`
+	Stream        bool                         `json:"stream,omitempty"`
+	StreamOptions *chatCompletionStreamOptions `json:"stream_options,omitempty"`
+}
+
+type chatCompletionStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatCompletionMessage struct {
@@ -308,6 +287,209 @@ type chatCompletionResponse struct {
 		Type    string `json:"type"`
 		Code    any    `json:"code"`
 	} `json:"error"`
+}
+
+type chatCompletionStreamChunk struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	Object  string `json:"object"`
+	Choices []struct {
+		FinishReason string `json:"finish_reason"`
+		Delta        struct {
+			Role      string `json:"role"`
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		PromptTokensDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+	} `json:"usage"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    any    `json:"code"`
+	} `json:"error"`
+}
+
+type openAIStreamToolState struct {
+	id      string
+	name    string
+	args    strings.Builder
+	started bool
+}
+
+func (l *OpenAILLM) streamChatCompletions(ctx context.Context, messages []Message, opts ChatOptions, ch chan<- StreamEvent) {
+	traceID := TraceIDFromContext(ctx)
+	if l.baseURL == "" {
+		ch <- StreamEvent{Err: errors.New("openai-compatible base url is required"), Done: true}
+		return
+	}
+	requestBody, err := buildChatCompletionRequest(messages, opts)
+	if err != nil {
+		l.log(traceID, "openai chat_completions stream build_request error=%v", err)
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+	requestBody.Stream = true
+	requestBody.StreamOptions = &chatCompletionStreamOptions{IncludeUsage: true}
+
+	data, err := json.Marshal(requestBody)
+	if err != nil {
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+
+	endpoint := l.baseURL + "/chat/completions"
+	l.log(traceID, "openai chat_completions stream request endpoint=%s model=%s messages=%d tools=%d", endpoint, requestBody.Model, len(requestBody.Messages), len(requestBody.Tools))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		l.log(traceID, "openai chat_completions stream new_request error=%v", err)
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if l.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+l.apiKey)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		l.log(traceID, "openai chat_completions stream network_error=%+v", err)
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			l.log(traceID, "openai chat_completions stream read_error_body error=%+v", readErr)
+			ch <- StreamEvent{Err: readErr, Done: true}
+			return
+		}
+		message := strings.TrimSpace(string(body))
+		l.log(traceID, "openai chat_completions stream response_error status=%d body=%s", resp.StatusCode, message)
+		ch <- StreamEvent{Err: fmt.Errorf("chat completions stream failed: status=%d message=%s", resp.StatusCode, message), Done: true}
+		return
+	}
+
+	toolStates := map[int]*openAIStreamToolState{}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" {
+			break
+		}
+
+		var chunk chatCompletionStreamChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			l.log(traceID, "openai chat_completions stream decode_error error=%+v payload=%s", err, payload)
+			ch <- StreamEvent{Err: fmt.Errorf("decode chat completion stream chunk: %w", err), Done: true}
+			return
+		}
+		if chunk.Error != nil {
+			l.log(traceID, "openai chat_completions stream event_error=%s payload=%s", chunk.Error.Message, payload)
+			ch <- StreamEvent{Err: errors.New(chunk.Error.Message), Done: true}
+			return
+		}
+		if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
+			ch <- StreamEvent{
+				Type:              "usage",
+				InputTokens:       chunk.Usage.PromptTokens,
+				OutputTokens:      chunk.Usage.CompletionTokens,
+				CachedInputTokens: chunk.Usage.PromptTokensDetails.CachedTokens,
+			}
+		}
+
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				ch <- StreamEvent{Type: "text", Text: choice.Delta.Content}
+			}
+			for _, toolDelta := range choice.Delta.ToolCalls {
+				state := toolStates[toolDelta.Index]
+				if state == nil {
+					state = &openAIStreamToolState{}
+					toolStates[toolDelta.Index] = state
+				}
+				if toolDelta.ID != "" {
+					state.id = toolDelta.ID
+				}
+				if toolDelta.Function.Name != "" {
+					state.name = toolDelta.Function.Name
+				}
+				if !state.started && state.id != "" {
+					state.started = true
+					ch <- StreamEvent{
+						Type:       "tool_use",
+						ToolID:     state.id,
+						ToolCallID: state.id,
+						ToolName:   state.name,
+					}
+				}
+				if toolDelta.Function.Arguments != "" {
+					state.args.WriteString(toolDelta.Function.Arguments)
+					if state.started {
+						ch <- StreamEvent{
+							Type:      "tool_use_delta",
+							ToolID:    state.id,
+							ToolName:  state.name,
+							ToolInput: toolDelta.Function.Arguments,
+						}
+					}
+				}
+			}
+			if choice.FinishReason == "tool_calls" {
+				indexes := make([]int, 0, len(toolStates))
+				for index := range toolStates {
+					indexes = append(indexes, index)
+				}
+				sort.Ints(indexes)
+				for _, index := range indexes {
+					state := toolStates[index]
+					toolID := state.id
+					if toolID == "" {
+						toolID = fmt.Sprintf("tool_call_%d", index)
+					}
+					ch <- StreamEvent{
+						Type:       "tool_use_end",
+						ToolID:     toolID,
+						ToolCallID: toolID,
+						ToolName:   state.name,
+						ToolInput:  state.args.String(),
+					}
+					delete(toolStates, index)
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		l.log(traceID, "openai chat_completions stream read_error=%+v", err)
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+	l.log(traceID, "openai chat_completions stream completed")
+	ch <- StreamEvent{Done: true}
 }
 
 func (l *OpenAILLM) chatCompletions(ctx context.Context, messages []Message, opts ChatOptions) (LLMResponse, error) {

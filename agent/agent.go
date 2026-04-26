@@ -634,6 +634,13 @@ func (agent *Agent) autoCompactMessagesIfNeeded(ctx context.Context) {
 	keepRecent := agent.autoCompactKeepRecent
 	llm := agent.llm
 	toolBudget := agent.toolBudget
+	model := agent.model
+	promptCache := agent.promptCache
+	var system *string
+	if agent.system != "" {
+		systemValue := agent.system
+		system = &systemValue
+	}
 	if !enabled || llm == nil || threshold <= 0 || EstimateMessagesSize(agent.messages) <= threshold {
 		agent.mu.Unlock()
 		return
@@ -646,6 +653,12 @@ func (agent *Agent) autoCompactMessagesIfNeeded(ctx context.Context) {
 	compacted := CompactMessagesWithOptions(messagesSnapshot, llm, CompactOptions{
 		KeepRecentRounds: keepRecent,
 		ToolBudget:       toolBudget,
+		Context:          ctx,
+		ChatOptions: ChatOptions{
+			System:      system,
+			Model:       model,
+			PromptCache: promptCache,
+		},
 	})
 	if len(compacted) == 0 || len(compacted) >= len(messagesSnapshot) {
 		agent.log(traceID, "compact skipped before=%d after=%d", len(messagesSnapshot), len(compacted))
@@ -824,7 +837,9 @@ func (agent *Agent) runStreamingToolTurnAttempt(ctx context.Context, llm LLM, me
 			}
 			toolInput := event.ToolInput
 			if builder := activeToolUses[event.ToolID]; builder != nil {
-				toolInput = builder.String()
+				if builder.Len() > 0 {
+					toolInput = builder.String()
+				}
 			}
 			toolCallID := event.ToolCallID
 			if toolCallID == "" {
@@ -1133,8 +1148,8 @@ func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution
 	traceID := prepared.traceID
 	content, err := agent.callPreparedTool(prepared)
 	if err != nil {
-		agent.log(traceID, "tool_execute error name=%s id=%s error=%v", prepared.name, prepared.toolUse.ID, err)
-		result.Content = formatToolError(result.ToolUse, err)
+		agent.log(traceID, "tool_execute error name=%s id=%s output_chars=%d error=%v", prepared.name, prepared.toolUse.ID, len(content), err)
+		result.Content = formatToolErrorWithOutput(result.ToolUse, err, content)
 		result.IsError = true
 		return
 	}
@@ -1145,14 +1160,16 @@ func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution
 
 func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, error) {
 	result, err := prepared.registry.Call(prepared.name, prepared.input)
-	if err != nil {
-		return "", err
-	}
-
 	if prepared.enableToolBudget {
-		return tool.TruncateToolResult(result, prepared.toolBudget.MaxLen, prepared.toolBudget.HeadLen, prepared.toolBudget.TailLen)
+		truncated, truncateErr := tool.TruncateToolResult(result, prepared.toolBudget.MaxLen, prepared.toolBudget.HeadLen, prepared.toolBudget.TailLen)
+		if truncateErr != nil && err == nil {
+			return "", truncateErr
+		}
+		if truncateErr == nil {
+			result = truncated
+		}
 	}
-	return result, nil
+	return result, err
 }
 
 func mustMarshalToolInput(input map[string]any) string {
@@ -1170,6 +1187,14 @@ tool_use_id: %s
 code: %s
 recoverable: true
 message: %s`, toolUse.Name, toolUse.ID, classifyToolError(err), err.Error())
+}
+
+func formatToolErrorWithOutput(toolUse ToolUse, err error, output string) string {
+	message := formatToolError(toolUse, err)
+	if strings.TrimSpace(output) == "" {
+		return message
+	}
+	return message + "\noutput:\n" + output
 }
 
 func classifyToolError(err error) string {

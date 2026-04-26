@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -96,38 +97,7 @@ func (l *AnthropicLLM) Stream(ctx context.Context, messages []Message, opts Chat
 		defer close(streamRes)
 
 		if l.useMessages {
-			resp, err := l.messages(ctx, messages, opts)
-			if err != nil {
-				streamRes <- StreamEvent{Err: err, Done: true}
-				return
-			}
-			if resp.Content != "" {
-				streamRes <- StreamEvent{Type: "text", Text: resp.Content}
-			}
-			for _, toolUse := range resp.ToolUses {
-				streamRes <- StreamEvent{
-					Type:       "tool_use",
-					ToolID:     toolUse.ID,
-					ToolCallID: toolUse.ID,
-					ToolName:   toolUse.Name,
-					ToolInput:  toolUse.Input,
-				}
-				streamRes <- StreamEvent{
-					Type:       "tool_use_end",
-					ToolID:     toolUse.ID,
-					ToolCallID: toolUse.ID,
-					ToolName:   toolUse.Name,
-					ToolInput:  toolUse.Input,
-				}
-			}
-			streamRes <- StreamEvent{
-				Type:                     "usage",
-				InputTokens:              resp.InputTokens,
-				OutputTokens:             resp.OutputTokens,
-				CachedInputTokens:        resp.CachedInputTokens,
-				CacheCreationInputTokens: resp.CacheCreationInputTokens,
-			}
-			streamRes <- StreamEvent{Done: true}
+			l.streamMessages(ctx, messages, opts, streamRes)
 			return
 		}
 
@@ -267,6 +237,7 @@ type anthropicMessageRequest struct {
 	Messages    []anthropicCompatMessage `json:"messages"`
 	Tools       []anthropicCompatTool    `json:"tools,omitempty"`
 	Temperature *float64                 `json:"temperature,omitempty"`
+	Stream      bool                     `json:"stream,omitempty"`
 }
 
 type anthropicCompatMessage struct {
@@ -314,6 +285,218 @@ type anthropicMessageResponse struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 	} `json:"error"`
+}
+
+type anthropicStreamEvent struct {
+	Type         string                       `json:"type"`
+	Index        int64                        `json:"index"`
+	Message      *anthropicMessageResponse    `json:"message,omitempty"`
+	ContentBlock *anthropicCompatContentBlock `json:"content_block,omitempty"`
+	Delta        struct {
+		Type        string `json:"type"`
+		Text        string `json:"text"`
+		PartialJSON string `json:"partial_json"`
+		StopReason  string `json:"stop_reason"`
+	} `json:"delta,omitempty"`
+	Usage struct {
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	} `json:"usage,omitempty"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error,omitempty"`
+}
+
+type anthropicStreamToolState struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
+func (l *AnthropicLLM) streamMessages(ctx context.Context, messages []Message, opts ChatOptions, ch chan<- StreamEvent) {
+	traceID := TraceIDFromContext(ctx)
+	if l.baseURL == "" {
+		ch <- StreamEvent{Err: errors.New("anthropic-compatible base url is required"), Done: true}
+		return
+	}
+	requestBody, err := buildAnthropicCompatRequest(messages, opts)
+	if err != nil {
+		l.log(traceID, "anthropic messages stream build_request error=%v", err)
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+	requestBody.Stream = true
+
+	data, err := json.Marshal(requestBody)
+	if err != nil {
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+
+	endpoint := l.baseURL + "/messages"
+	l.log(traceID, "anthropic messages stream request endpoint=%s model=%s messages=%d tools=%d", endpoint, requestBody.Model, len(requestBody.Messages), len(requestBody.Tools))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		l.log(traceID, "anthropic messages stream new_request error=%v", err)
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if l.apiKey != "" {
+		req.Header.Set("x-api-key", l.apiKey)
+		req.Header.Set("Authorization", "Bearer "+l.apiKey)
+	}
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		l.log(traceID, "anthropic messages stream network_error=%+v", err)
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			l.log(traceID, "anthropic messages stream read_error_body error=%+v", readErr)
+			ch <- StreamEvent{Err: readErr, Done: true}
+			return
+		}
+		message := strings.TrimSpace(string(body))
+		l.log(traceID, "anthropic messages stream response_error status=%d body=%s", resp.StatusCode, message)
+		ch <- StreamEvent{Err: fmt.Errorf("anthropic messages stream failed: status=%d message=%s", resp.StatusCode, message), Done: true}
+		return
+	}
+
+	toolStates := map[int64]*anthropicStreamToolState{}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	var eventName string
+	var dataLines []string
+	dispatch := func() bool {
+		if len(dataLines) == 0 {
+			eventName = ""
+			return true
+		}
+		payload := strings.Join(dataLines, "\n")
+		dataLines = nil
+		var event anthropicStreamEvent
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			l.log(traceID, "anthropic messages stream decode_error event=%s error=%+v payload=%s", eventName, err, payload)
+			ch <- StreamEvent{Err: fmt.Errorf("decode anthropic stream event: %w", err), Done: true}
+			return false
+		}
+		if event.Type == "" {
+			event.Type = eventName
+		}
+		if event.Error != nil {
+			l.log(traceID, "anthropic messages stream event_error=%s payload=%s", event.Error.Message, payload)
+			ch <- StreamEvent{Err: errors.New(event.Error.Message), Done: true}
+			return false
+		}
+
+		switch event.Type {
+		case "message_start":
+			if event.Message != nil {
+				ch <- StreamEvent{
+					Type:                     "usage",
+					InputTokens:              event.Message.Usage.InputTokens,
+					OutputTokens:             event.Message.Usage.OutputTokens,
+					CachedInputTokens:        event.Message.Usage.CacheReadInputTokens,
+					CacheCreationInputTokens: event.Message.Usage.CacheCreationInputTokens,
+				}
+			}
+		case "content_block_start":
+			if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
+				input := string(event.ContentBlock.Input)
+				state := &anthropicStreamToolState{id: event.ContentBlock.ID, name: event.ContentBlock.Name}
+				if input != "" && input != "null" && input != "{}" {
+					state.args.WriteString(input)
+				}
+				toolStates[event.Index] = state
+				ch <- StreamEvent{
+					Type:       "tool_use",
+					ToolID:     state.id,
+					ToolCallID: state.id,
+					ToolName:   state.name,
+					ToolInput:  input,
+				}
+			}
+		case "content_block_delta":
+			if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
+				ch <- StreamEvent{Type: "text", Text: event.Delta.Text}
+			}
+			if event.Delta.Type == "input_json_delta" {
+				state := toolStates[event.Index]
+				if state != nil {
+					state.args.WriteString(event.Delta.PartialJSON)
+					ch <- StreamEvent{
+						Type:      "tool_use_delta",
+						ToolID:    state.id,
+						ToolName:  state.name,
+						ToolInput: event.Delta.PartialJSON,
+					}
+				}
+			}
+		case "content_block_stop":
+			state := toolStates[event.Index]
+			if state != nil {
+				ch <- StreamEvent{
+					Type:       "tool_use_end",
+					ToolID:     state.id,
+					ToolCallID: state.id,
+					ToolName:   state.name,
+					ToolInput:  state.args.String(),
+				}
+				delete(toolStates, event.Index)
+			}
+		case "message_delta":
+			ch <- StreamEvent{
+				Type:                     "usage",
+				InputTokens:              event.Usage.InputTokens,
+				OutputTokens:             event.Usage.OutputTokens,
+				CachedInputTokens:        event.Usage.CacheReadInputTokens,
+				CacheCreationInputTokens: event.Usage.CacheCreationInputTokens,
+			}
+		case "message_stop":
+			ch <- StreamEvent{Done: true}
+			return false
+		}
+		eventName = ""
+		return true
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			if !dispatch() {
+				return
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if len(dataLines) > 0 && !dispatch() {
+		return
+	}
+	if err := scanner.Err(); err != nil {
+		l.log(traceID, "anthropic messages stream read_error=%+v", err)
+		ch <- StreamEvent{Err: err, Done: true}
+		return
+	}
+	l.log(traceID, "anthropic messages stream completed")
+	ch <- StreamEvent{Done: true}
 }
 
 func (l *AnthropicLLM) messages(ctx context.Context, messages []Message, opts ChatOptions) (LLMResponse, error) {

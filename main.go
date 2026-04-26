@@ -723,9 +723,6 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 	if cfg.APIKey == "" {
 		missing = append(missing, "API_KEY")
 	}
-	if cfg.BaseURL == "" {
-		missing = append(missing, "BASE_URL")
-	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
 	}
