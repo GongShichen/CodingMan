@@ -9,28 +9,28 @@ import (
 	"time"
 )
 
-const defaultAgentsMdMaxBytes = 64 * 1024
+const defaultAgentsMDMaxBytes = 64 * 1024
 
 type ContextConfig struct {
 	Cwd              string
 	BaseSystem       string
 	IncludeDate      bool
-	LoadAgentsMd     bool
+	LoadAgentsMD     bool
 	AutoCompact      bool
 	CompactThreshold int
 	KeepRecentRounds int
-	MaxAgentsMdBytes int
+	MaxAgentsMDBytes int
 }
 
 func DefaultContextConfig() ContextConfig {
 	return ContextConfig{
 		Cwd:              ".",
 		IncludeDate:      true,
-		LoadAgentsMd:     true,
+		LoadAgentsMD:     true,
 		AutoCompact:      true,
 		CompactThreshold: defaultAutoCompactSizeThreshold,
 		KeepRecentRounds: defaultAutoCompactRecentRounds,
-		MaxAgentsMdBytes: defaultAgentsMdMaxBytes,
+		MaxAgentsMDBytes: defaultAgentsMDMaxBytes,
 	}
 }
 
@@ -45,13 +45,13 @@ func normalizeContextConfig(config ContextConfig) ContextConfig {
 	if config.KeepRecentRounds <= 0 {
 		config.KeepRecentRounds = defaults.KeepRecentRounds
 	}
-	if config.MaxAgentsMdBytes <= 0 {
-		config.MaxAgentsMdBytes = defaults.MaxAgentsMdBytes
+	if config.MaxAgentsMDBytes <= 0 {
+		config.MaxAgentsMDBytes = defaults.MaxAgentsMDBytes
 	}
 	return config
 }
 
-func FindAgentsMd(startDir string) (string, error) {
+func FindAgentsMD(startDir string) (string, error) {
 	/*
 		从指定目录向上递归查找AGENTS.md文件，
 		查找顺序： startDir -> parent ->grandparent -> ... -> root
@@ -98,8 +98,8 @@ func FindAgentsMd(startDir string) (string, error) {
 	}
 }
 
-func LoadAgentsMd(startDir string) (string, error) {
-	filePath, err := FindAgentsMd(startDir)
+func LoadAgentsMD(startDir string) (string, error) {
+	filePath, err := FindAgentsMD(startDir)
 	if err != nil {
 		return "", err
 	}
@@ -127,11 +127,11 @@ func BuildSystemPromptWithConfig(config ContextConfig) (string, error) {
 		parts = append(parts, fmt.Sprintf("%s\n", config.BaseSystem))
 	}
 
-	if config.LoadAgentsMd {
-		agentsMd, _ := loadAgentsMdWithLimit(config.Cwd, config.MaxAgentsMdBytes)
-		if agentsMd != "" {
+	if config.LoadAgentsMD {
+		agentsMD, _ := loadAgentsMDWithLimit(config.Cwd, config.MaxAgentsMDBytes)
+		if agentsMD != "" {
 			parts = append(parts, "## 项目规范 (AGENTS.md)\n")
-			parts = append(parts, agentsMd)
+			parts = append(parts, agentsMD)
 		}
 	}
 
@@ -157,8 +157,8 @@ func BuildSystemPromptWithConfig(config ContextConfig) (string, error) {
 	return strings.Join(parts, "\n"), nil
 }
 
-func loadAgentsMdWithLimit(startDir string, maxBytes int) (string, error) {
-	filePath, err := FindAgentsMd(startDir)
+func loadAgentsMDWithLimit(startDir string, maxBytes int) (string, error) {
+	filePath, err := FindAgentsMD(startDir)
 	if err != nil {
 		return "", err
 	}

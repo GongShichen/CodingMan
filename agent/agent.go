@@ -31,6 +31,7 @@ type Agent struct {
 	contextConfig            ContextConfig
 	retryConfig              RetryConfig
 	permission               *PermissionManager
+	promptCache              PromptCacheConfig
 }
 
 type AgentConfig struct {
@@ -47,6 +48,7 @@ type AgentConfig struct {
 	ToolBudget               ToolBudget
 	RetryConfig              RetryConfig
 	Permission               PermissionConfig
+	PromptCache              PromptCacheConfig
 }
 
 type ToolBudget struct {
@@ -78,6 +80,10 @@ func NewAgent(config AgentConfig) *Agent {
 	if builtSystem, err := BuildSystemPromptWithConfig(contextConfig); err == nil {
 		system = builtSystem
 	}
+	promptCacheConfig := config.PromptCache
+	if promptCacheConfig == (PromptCacheConfig{}) {
+		promptCacheConfig.Enabled = true
+	}
 
 	agent := &Agent{
 		llm:                      config.LLM,
@@ -97,6 +103,7 @@ func NewAgent(config AgentConfig) *Agent {
 		contextConfig:            contextConfig,
 		retryConfig:              defaultRetryConfig(config.RetryConfig),
 		permission:               NewPermissionManager(config.Permission),
+		promptCache:              normalizePromptCacheConfig(promptCacheConfig),
 	}
 
 	return agent
@@ -161,12 +168,14 @@ func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBl
 	llm := agent.llm
 	tools := agent.currentToolsLocked()
 	retryConfig := agent.retryConfig
+	promptCache := agent.promptCache
 	agent.mu.Unlock()
 
 	resp, err := retryChat(ctx, llm, messagesSnapshot, ChatOptions{
-		System: system,
-		Model:  model,
-		Tools:  tools,
+		System:      system,
+		Model:       model,
+		Tools:       tools,
+		PromptCache: promptCache,
 	}, retryConfig)
 	if err != nil {
 		return LLMResponse{StopReason: err.Error()}, err
@@ -216,12 +225,14 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		llm := agent.llm
 		tools := agent.currentToolsLocked()
 		retryConfig := agent.retryConfig
+		promptCache := agent.promptCache
 		agent.mu.Unlock()
 
 		resp, err := retryChat(ctx, llm, messagesSnapshot, ChatOptions{
-			System: system,
-			Model:  model,
-			Tools:  tools,
+			System:      system,
+			Model:       model,
+			Tools:       tools,
+			PromptCache: promptCache,
 		}, retryConfig)
 		if err != nil {
 			consecutiveAPIErrors++
@@ -302,6 +313,7 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 	model := agent.model
 	llm := agent.llm
 	tools := agent.currentToolsLocked()
+	promptCache := agent.promptCache
 	agent.mu.Unlock()
 
 	go func(messagesSnapshot []Message) {
@@ -309,9 +321,10 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 
 		var builder strings.Builder
 		stream := llm.Stream(ctx, messagesSnapshot, ChatOptions{
-			System: system,
-			Model:  model,
-			Tools:  tools,
+			System:      system,
+			Model:       model,
+			Tools:       tools,
+			PromptCache: promptCache,
 		})
 
 		for event := range stream {
@@ -428,6 +441,24 @@ func (agent *Agent) Permission() *PermissionManager {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	return agent.permission
+}
+
+func (agent *Agent) PromptCache() PromptCacheConfig {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return agent.promptCache
+}
+
+func (agent *Agent) SetPromptCache(config PromptCacheConfig) {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.promptCache = normalizePromptCacheConfig(config)
+}
+
+func (agent *Agent) SetPromptCacheEnabled(enabled bool) {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.promptCache.Enabled = enabled
 }
 
 func (agent *Agent) snapshotMessagesLocked() []Message {

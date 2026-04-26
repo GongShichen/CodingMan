@@ -1,3 +1,3 @@
-module github.com/GongShichen/CodingMan/toolUse
+module github.com/GongShichen/CodingMan/tool
 
 go 1.26

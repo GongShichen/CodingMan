@@ -20,12 +20,15 @@ type LLMConfig struct {
 }
 
 type LLMResponse struct {
-	Content                   string
-	InputTokens, OutputTokens int
-	StopReason                string
-	ToolUses                  []ToolUse
-	RetryAttempts             int
-	Raw                       any
+	Content                  string
+	InputTokens              int
+	OutputTokens             int
+	CachedInputTokens        int
+	CacheCreationInputTokens int
+	StopReason               string
+	ToolUses                 []ToolUse
+	RetryAttempts            int
+	Raw                      any
 }
 
 type ContentType string
@@ -43,7 +46,6 @@ type ContentBlock struct {
 	Data      string
 	MediaType string
 	ImageURL  string
-	ToolId    string
 	ToolID    string
 	ToolName  string
 	ToolInput string
@@ -97,7 +99,6 @@ func ToolUseBlock(id string, name string, input string) ContentBlock {
 	return ContentBlock{
 		Type:      ContentTypeToolUse,
 		ToolID:    id,
-		ToolId:    id,
 		ToolName:  name,
 		ToolInput: input,
 	}
@@ -108,7 +109,6 @@ func ToolResultBlock(toolID string, text string, isError bool) ContentBlock {
 		Type:    ContentTypeToolResult,
 		Text:    text,
 		ToolID:  toolID,
-		ToolId:  toolID,
 		IsError: isError,
 	}
 }
@@ -124,6 +124,7 @@ type ChatOptions struct {
 	Temperature *float64
 	System      *string
 	Tools       []tool.Tool
+	PromptCache PromptCacheConfig
 }
 
 type StreamEvent struct {

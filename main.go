@@ -38,6 +38,7 @@ type RuntimeConfig struct {
 	EnableToolBudget bool
 	ToolBudget       agent.ToolBudget
 	Retry            agent.RetryConfig
+	PromptCache      agent.PromptCacheConfig
 }
 
 func main() {
@@ -71,6 +72,7 @@ func main() {
 		EnableToolBudget:         cfg.EnableToolBudget,
 		ToolBudget:               cfg.ToolBudget,
 		RetryConfig:              cfg.Retry,
+		PromptCache:              cfg.PromptCache,
 	})
 
 	RunTUI(a, cfg, source)
@@ -134,9 +136,11 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 		if resp.StopReason != "" && resp.StopReason != "completed" {
 			fmt.Printf("%sstop: %s%s\n", colorGray, resp.StopReason, colorReset)
 		}
-		fmt.Printf("%sinput=%d output=%d retry=%d elapsed=%s%s\n\n",
+		fmt.Printf("%sinput=%d cached=%d cache_write=%d output=%d retry=%d elapsed=%s%s\n\n",
 			colorGray,
 			resp.InputTokens,
+			resp.CachedInputTokens,
+			resp.CacheCreationInputTokens,
 			resp.OutputTokens,
 			resp.RetryAttempts,
 			time.Since(start).Round(time.Millisecond),
@@ -159,6 +163,9 @@ func printHelp() {
 	fmt.Println(colorDim + "Slash commands:" + colorReset)
 	fmt.Println("  /help                         show this help")
 	fmt.Println("  /clear                        clear conversation history")
+	fmt.Println("  /cache                        show prompt cache status")
+	fmt.Println("  /cache on                     enable prompt cache")
+	fmt.Println("  /cache off                    disable prompt cache")
 	fmt.Println("  /permission                   show permission mode and policy")
 	fmt.Println("  /permission ask               ask before tool calls")
 	fmt.Println("  /permission allow-deny        use tool allow/deny policy")
@@ -198,6 +205,8 @@ func handleSlashCommand(a *agent.Agent, prompt string) bool {
 		}
 		fmt.Printf("%spermission mode:%s %s\n", colorGray, colorReset, mode)
 		return true
+	case "/cache":
+		return handleCacheCommand(a, fields)
 	case "/permissions":
 		permissions := a.Permission()
 		if permissions == nil {
@@ -231,6 +240,43 @@ func handleSlashCommand(a *agent.Agent, prompt string) bool {
 	default:
 		return false
 	}
+}
+
+func handleCacheCommand(a *agent.Agent, fields []string) bool {
+	if len(fields) == 1 {
+		printCacheStatus(a.PromptCache())
+		return true
+	}
+	cache := a.PromptCache()
+	switch strings.ToLower(fields[1]) {
+	case "on", "enable", "enabled":
+		cache.Enabled = true
+	case "off", "disable", "disabled":
+		cache.Enabled = false
+	default:
+		fmt.Println(colorRed + "usage: /cache [on|off]" + colorReset)
+		return true
+	}
+	a.SetPromptCache(cache)
+	printCacheStatus(a.PromptCache())
+	return true
+}
+
+func printCacheStatus(cache agent.PromptCacheConfig) {
+	state := "off"
+	if cache.Enabled {
+		state = "on"
+	}
+	key := cache.Key
+	if key == "" {
+		key = "auto"
+	}
+	fmt.Printf("%sprompt cache:%s %s  %skey:%s %s  %sretention:%s %s  %sttl:%s %s\n",
+		colorGray, colorReset, state,
+		colorGray, colorReset, key,
+		colorGray, colorReset, cache.Retention,
+		colorGray, colorReset, cache.TTL,
+	)
 }
 
 func printPermissionStatus(permissions *agent.PermissionManager) {
@@ -323,11 +369,11 @@ func loadRuntimeConfig(projectRoot string) (RuntimeConfig, string, error) {
 	cfg.Context.Cwd = valueOrDefault(values["CWD"], projectRoot)
 	cfg.Context.BaseSystem = values["BASE_SYSTEM"]
 	cfg.Context.IncludeDate = boolValue(values, "INCLUDE_DATE", cfg.Context.IncludeDate)
-	cfg.Context.LoadAgentsMd = boolValue(values, "LOAD_AGENTS_MD", cfg.Context.LoadAgentsMd)
+	cfg.Context.LoadAgentsMD = boolValue(values, "LOAD_AGENTS_MD", cfg.Context.LoadAgentsMD)
 	cfg.Context.AutoCompact = boolValue(values, "AUTO_COMPACT", cfg.Context.AutoCompact)
 	cfg.Context.CompactThreshold = intValue(values, "COMPACT_THRESHOLD", cfg.Context.CompactThreshold)
 	cfg.Context.KeepRecentRounds = intValue(values, "KEEP_RECENT_ROUNDS", cfg.Context.KeepRecentRounds)
-	cfg.Context.MaxAgentsMdBytes = intValue(values, "MAX_AGENTS_MD_BYTES", cfg.Context.MaxAgentsMdBytes)
+	cfg.Context.MaxAgentsMDBytes = intValue(values, "MAX_AGENTS_MD_BYTES", cfg.Context.MaxAgentsMDBytes)
 
 	cfg.MaxLLMTurns = intValue(values, "MAX_LLM_TURNS", 20)
 	cfg.MaxToolCalls = intValue(values, "MAX_TOOL_CALLS", 50)
@@ -347,6 +393,12 @@ func loadRuntimeConfig(projectRoot string) (RuntimeConfig, string, error) {
 		MaxDelay:     durationValue(values, "RETRY_MAX_DELAY", 60*time.Second),
 		Multiplier:   floatValue(values, "RETRY_MULTIPLIER", 2.0),
 		Jitter:       floatValue(values, "RETRY_JITTER", 0.2),
+	}
+	cfg.PromptCache = agent.PromptCacheConfig{
+		Enabled:   boolValue(values, "PROMPT_CACHE_ENABLED", true),
+		Key:       values["PROMPT_CACHE_KEY"],
+		Retention: valueOrDefault(values["PROMPT_CACHE_RETENTION"], agent.PromptCacheRetentionInMemory),
+		TTL:       valueOrDefault(values["PROMPT_CACHE_TTL"], agent.PromptCacheTTL5m),
 	}
 
 	if err := validateRuntimeConfig(cfg); err != nil {

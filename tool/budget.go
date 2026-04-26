@@ -1,4 +1,4 @@
-package toolUse
+package tool
 
 import "fmt"
 

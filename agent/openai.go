@@ -51,12 +51,13 @@ func (l *OpenAILLM) Chat(ctx context.Context, messages []Message, opts ChatOptio
 	}
 
 	return LLMResponse{
-		Content:      resp.OutputText(),
-		InputTokens:  int(resp.Usage.InputTokens),
-		OutputTokens: int(resp.Usage.OutputTokens),
-		StopReason:   string(resp.Status),
-		ToolUses:     extractOpenAIToolUses(resp.Output),
-		Raw:          resp,
+		Content:           resp.OutputText(),
+		InputTokens:       int(resp.Usage.InputTokens),
+		OutputTokens:      int(resp.Usage.OutputTokens),
+		CachedInputTokens: int(resp.Usage.InputTokensDetails.CachedTokens),
+		StopReason:        string(resp.Status),
+		ToolUses:          extractOpenAIToolUses(resp.Output),
+		Raw:               resp,
 	}, nil
 }
 
@@ -160,6 +161,16 @@ func buildOpenAIResponseParams(messages []Message, opts ChatOptions) (responses.
 	if opts.Temperature != nil {
 		params.Temperature = param.NewOpt(*opts.Temperature)
 	}
+	cacheConfig := normalizePromptCacheConfig(opts.PromptCache)
+	if cacheConfig.Enabled {
+		params.PromptCacheKey = param.NewOpt(promptCacheKey(cacheConfig, stringPtrValue(opts.System), opts.Tools))
+		switch cacheConfig.Retention {
+		case PromptCacheRetention24h:
+			params.PromptCacheRetention = responses.ResponseNewParamsPromptCacheRetention24h
+		default:
+			params.PromptCacheRetention = responses.ResponseNewParamsPromptCacheRetentionInMemory
+		}
+	}
 
 	for _, tool := range opts.Tools {
 		convertedTool, err := toOpenAITool(tool)
@@ -178,6 +189,13 @@ func buildOpenAIResponseParams(messages []Message, opts ChatOptions) (responses.
 	}
 
 	return params, nil
+}
+
+func stringPtrValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func toOpenAIInputItems(message Message) ([]responses.ResponseInputItemUnionParam, error) {

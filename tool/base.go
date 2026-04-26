@@ -1,4 +1,4 @@
-package toolUse
+package tool
 
 type Tool interface {
 	Name() string

@@ -50,12 +50,14 @@ func (l *AnthropicLLM) Chat(ctx context.Context, messages []Message, opts ChatOp
 	}
 
 	return LLMResponse{
-		Content:      extractAnthropicText(resp.Content),
-		InputTokens:  int(resp.Usage.InputTokens),
-		OutputTokens: int(resp.Usage.OutputTokens),
-		StopReason:   string(resp.StopReason),
-		ToolUses:     extractAnthropicToolUses(resp.Content),
-		Raw:          resp,
+		Content:                  extractAnthropicText(resp.Content),
+		InputTokens:              int(resp.Usage.InputTokens),
+		OutputTokens:             int(resp.Usage.OutputTokens),
+		CachedInputTokens:        int(resp.Usage.CacheReadInputTokens),
+		CacheCreationInputTokens: int(resp.Usage.CacheCreationInputTokens),
+		StopReason:               string(resp.StopReason),
+		ToolUses:                 extractAnthropicToolUses(resp.Content),
+		Raw:                      resp,
 	}, nil
 }
 
@@ -181,6 +183,15 @@ func buildAnthropicMessageParams(messages []Message, opts ChatOptions) (anthropi
 	if opts.System != nil && *opts.System != "" {
 		params.System = []anthropic.TextBlockParam{{Text: *opts.System}}
 	}
+	cacheConfig := normalizePromptCacheConfig(opts.PromptCache)
+	if cacheConfig.Enabled {
+		cacheControl := anthropicCacheControl(cacheConfig)
+		if len(params.System) > 0 {
+			params.System[len(params.System)-1].CacheControl = cacheControl
+		} else {
+			params.CacheControl = cacheControl
+		}
+	}
 
 	for _, tool := range opts.Tools {
 		convertedTool, err := toAnthropicTool(tool)
@@ -188,6 +199,11 @@ func buildAnthropicMessageParams(messages []Message, opts ChatOptions) (anthropi
 			return anthropic.MessageNewParams{}, err
 		}
 		params.Tools = append(params.Tools, convertedTool)
+	}
+	if cacheConfig.Enabled && len(params.Tools) > 0 {
+		if cacheControl := params.Tools[len(params.Tools)-1].GetCacheControl(); cacheControl != nil {
+			*cacheControl = anthropicCacheControl(cacheConfig)
+		}
 	}
 
 	for _, message := range messages {
@@ -199,6 +215,17 @@ func buildAnthropicMessageParams(messages []Message, opts ChatOptions) (anthropi
 	}
 
 	return params, nil
+}
+
+func anthropicCacheControl(config PromptCacheConfig) anthropic.CacheControlEphemeralParam {
+	cacheControl := anthropic.NewCacheControlEphemeralParam()
+	switch config.TTL {
+	case PromptCacheTTL1h:
+		cacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
+	default:
+		cacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL5m
+	}
+	return cacheControl
 }
 
 func toAnthropicMessage(message Message) (anthropic.MessageParam, error) {

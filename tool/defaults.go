@@ -1,4 +1,4 @@
-package toolUse
+package tool
 
 func NewDefaultRegistry() *Registry {
 	registry := NewRegistry()
