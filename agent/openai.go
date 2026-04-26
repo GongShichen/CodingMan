@@ -93,10 +93,11 @@ func (l *OpenAILLM) Stream(ctx context.Context, messages []Message, opts ChatOpt
 				if item.Type == "function_call" {
 					toolCall := item.AsFunctionCall()
 					ch <- StreamEvent{
-						Type:      "tool_use",
-						ToolID:    toolCall.CallID,
-						ToolName:  toolCall.Name,
-						ToolInput: toolCall.Arguments,
+						Type:       "tool_use",
+						ToolID:     toolCall.ID,
+						ToolCallID: toolCall.CallID,
+						ToolName:   toolCall.Name,
+						ToolInput:  toolCall.Arguments,
 					}
 				}
 			case "response.function_call_arguments.delta":

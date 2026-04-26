@@ -21,6 +21,7 @@ type Agent struct {
 	turns                    int
 	maxTurn                  int
 	maxToolCalls             int
+	maxParallelToolCalls     int
 	maxConsecutiveToolErrors int
 	maxConsecutiveAPIErrors  int
 	enableToolBudget         bool
@@ -42,6 +43,7 @@ type AgentConfig struct {
 	MaxTurn                  int
 	MaxLLMTurns              int
 	MaxToolCalls             int
+	MaxParallelToolCalls     int
 	MaxConsecutiveToolErrors int
 	MaxConsecutiveAPIErrors  int
 	EnableToolBudget         bool
@@ -60,6 +62,7 @@ type ToolBudget struct {
 const (
 	defaultMaxTurn                  = 20
 	defaultMaxToolCalls             = 50
+	defaultMaxParallelToolCalls     = 4
 	defaultMaxConsecutiveToolErrors = 3
 	defaultMaxConsecutiveAPIErrors  = 3
 )
@@ -84,6 +87,10 @@ func NewAgent(config AgentConfig) *Agent {
 	if promptCacheConfig == (PromptCacheConfig{}) {
 		promptCacheConfig.Enabled = true
 	}
+	permissionConfig := config.Permission
+	if isZeroPermissionConfig(permissionConfig) {
+		permissionConfig = DefaultPermissionConfig()
+	}
 
 	agent := &Agent{
 		llm:                      config.LLM,
@@ -93,6 +100,7 @@ func NewAgent(config AgentConfig) *Agent {
 		messages:                 make([]Message, 0),
 		maxTurn:                  defaultMaxTurnValue(config.MaxLLMTurns, config.MaxTurn),
 		maxToolCalls:             defaultPositiveInt(config.MaxToolCalls, defaultMaxToolCalls),
+		maxParallelToolCalls:     defaultPositiveInt(config.MaxParallelToolCalls, defaultMaxParallelToolCalls),
 		maxConsecutiveToolErrors: defaultPositiveInt(config.MaxConsecutiveToolErrors, defaultMaxConsecutiveToolErrors),
 		maxConsecutiveAPIErrors:  defaultPositiveInt(config.MaxConsecutiveAPIErrors, defaultMaxConsecutiveAPIErrors),
 		enableToolBudget:         config.EnableToolBudget,
@@ -102,7 +110,7 @@ func NewAgent(config AgentConfig) *Agent {
 		autoCompactKeepRecent:    defaultAutoCompactKeepRecent(contextConfig.KeepRecentRounds),
 		contextConfig:            contextConfig,
 		retryConfig:              defaultRetryConfig(config.RetryConfig),
-		permission:               NewPermissionManager(config.Permission),
+		permission:               NewPermissionManager(permissionConfig),
 		promptCache:              normalizePromptCacheConfig(promptCacheConfig),
 	}
 
@@ -198,6 +206,7 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		agent.mu.Lock()
 		maxTurn := agent.maxTurn
 		maxToolCalls := agent.maxToolCalls
+		maxParallelToolCalls := agent.maxParallelToolCalls
 		maxConsecutiveToolErrors := agent.maxConsecutiveToolErrors
 		maxConsecutiveAPIErrors := agent.maxConsecutiveAPIErrors
 		agent.mu.Unlock()
@@ -224,22 +233,20 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		model := agent.model
 		llm := agent.llm
 		tools := agent.currentToolsLocked()
-		retryConfig := agent.retryConfig
 		promptCache := agent.promptCache
 		agent.mu.Unlock()
 
-		resp, err := retryChat(ctx, llm, messagesSnapshot, ChatOptions{
+		resp, results, err := agent.runStreamingToolTurn(ctx, llm, messagesSnapshot, ChatOptions{
 			System:      system,
 			Model:       model,
 			Tools:       tools,
 			PromptCache: promptCache,
-		}, retryConfig)
+		}, maxParallelToolCalls, maxToolCalls-toolCalls)
 		if err != nil {
 			consecutiveAPIErrors++
 			if consecutiveAPIErrors >= maxConsecutiveAPIErrors {
 				return LLMResponse{
-					StopReason:    "apierrors",
-					RetryAttempts: resp.RetryAttempts,
+					StopReason: "apierrors",
 				}, err
 			}
 			return LLMResponse{StopReason: err.Error()}, err
@@ -253,23 +260,14 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 			return resp, nil
 		}
 
-		for _, toolUse := range toolUses {
-			if toolCalls >= maxToolCalls {
-				return LLMResponse{StopReason: "maxtoolcalls"}, nil
-			}
-			toolCalls++
-
-			result, err := agent.ExecuteTool(ctx, toolUse.ToMap())
-			isError := false
-			if err != nil {
-				result = formatToolError(toolUse, err)
-				isError = true
+		toolCalls += len(toolUses)
+		agent.appendToolResultMessages(results)
+		for _, result := range results {
+			if result.IsError {
 				consecutiveToolErrors++
 			} else {
 				consecutiveToolErrors = 0
 			}
-			agent.appendToolResultMessage(toolUse, result, isError)
-
 			if consecutiveToolErrors >= maxConsecutiveToolErrors {
 				return LLMResponse{StopReason: "toolerrors"}, nil
 			}
@@ -409,13 +407,27 @@ func (agent *Agent) appendAssistantResponse(resp LLMResponse) {
 }
 
 func (agent *Agent) appendToolResultMessage(toolUse ToolUse, result string, isError bool) {
+	agent.appendToolResultMessages([]ToolResult{{
+		ToolUse: toolUse,
+		Content: result,
+		IsError: isError,
+	}})
+}
+
+func (agent *Agent) appendToolResultMessages(results []ToolResult) {
+	if len(results) == 0 {
+		return
+	}
+	content := make([]ContentBlock, 0, len(results))
+	for _, result := range results {
+		content = append(content, ToolResultBlock(result.ToolUse.ID, result.Content, result.IsError))
+	}
+
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	agent.messages = append(agent.messages, Message{
-		Role: "user",
-		Content: []ContentBlock{
-			ToolResultBlock(toolUse.ID, result, isError),
-		},
+		Role:    "user",
+		Content: content,
 	})
 }
 
@@ -511,18 +523,306 @@ func (agent *Agent) autoCompactMessagesIfNeeded() {
 }
 
 func (agent *Agent) ExecuteTool(ctx context.Context, toolUse map[string]any) (string, error) {
+	prepared, err := agent.prepareToolExecution(ctx, toolUse)
+	if err != nil {
+		return "", err
+	}
+	return agent.callPreparedTool(prepared)
+}
+
+func (agent *Agent) ExecuteTools(ctx context.Context, toolUses []ToolUse, maxParallel int) []ToolResult {
+	results := make([]ToolResult, len(toolUses))
+	preparedTools := make([]preparedToolExecution, len(toolUses))
+
+	for i, toolUse := range toolUses {
+		results[i].ToolUse = toolUse
+		prepared, err := agent.prepareToolExecution(ctx, toolUse.ToMap())
+		if err != nil {
+			results[i].Content = formatToolError(toolUse, err)
+			results[i].IsError = true
+			continue
+		}
+		preparedTools[i] = prepared
+	}
+
+	batches := buildToolExecutionBatches(preparedTools, results)
+	for _, batch := range batches {
+		if batch.parallel {
+			agent.executePreparedToolBatch(ctx, toolUses, preparedTools, results, batch.start, batch.end, maxParallel)
+			continue
+		}
+		if results[batch.start].IsError {
+			continue
+		}
+		agent.executePreparedToolIntoResult(preparedTools[batch.start], &results[batch.start])
+	}
+	return results
+}
+
+func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages []Message, opts ChatOptions, maxParallel int, maxToolCalls int) (LLMResponse, []ToolResult, error) {
+	stream := llm.Stream(ctx, messages, opts)
+	scheduler := newStreamingToolScheduler(agent, ctx, maxParallel)
+	defer scheduler.close()
+
+	var content strings.Builder
+	toolUses := make([]ToolUse, 0)
+	activeToolUses := make(map[string]*strings.Builder)
+	activeToolNames := make(map[string]string)
+	activeToolCallIDs := make(map[string]string)
+
+	for event := range stream {
+		if event.Err != nil {
+			return LLMResponse{}, nil, event.Err
+		}
+		if event.Text != "" {
+			content.WriteString(event.Text)
+		}
+
+		switch event.Type {
+		case "tool_use":
+			if event.ToolID == "" {
+				continue
+			}
+			builder := &strings.Builder{}
+			if event.ToolInput != "" {
+				builder.WriteString(event.ToolInput)
+			}
+			activeToolUses[event.ToolID] = builder
+			activeToolNames[event.ToolID] = event.ToolName
+			if event.ToolCallID != "" {
+				activeToolCallIDs[event.ToolID] = event.ToolCallID
+			}
+		case "tool_use_delta":
+			builder := activeToolUses[event.ToolID]
+			if builder != nil {
+				builder.WriteString(event.ToolInput)
+			}
+		case "tool_use_end":
+			if maxToolCalls <= 0 || len(toolUses) >= maxToolCalls {
+				continue
+			}
+			toolName := event.ToolName
+			if toolName == "" {
+				toolName = activeToolNames[event.ToolID]
+			}
+			toolInput := event.ToolInput
+			if builder := activeToolUses[event.ToolID]; builder != nil {
+				toolInput = builder.String()
+			}
+			toolCallID := event.ToolCallID
+			if toolCallID == "" {
+				toolCallID = activeToolCallIDs[event.ToolID]
+			}
+			if toolCallID == "" {
+				toolCallID = event.ToolID
+			}
+			toolUse := ToolUse{
+				ID:    toolCallID,
+				Name:  toolName,
+				Input: toolInput,
+			}
+			toolUses = append(toolUses, toolUse)
+			scheduler.add(toolUse)
+			delete(activeToolUses, event.ToolID)
+			delete(activeToolNames, event.ToolID)
+			delete(activeToolCallIDs, event.ToolID)
+		}
+	}
+
+	results := scheduler.finish()
+	return LLMResponse{
+		Content:    content.String(),
+		StopReason: "completed",
+		ToolUses:   toolUses,
+	}, results, nil
+}
+
+type streamingToolScheduler struct {
+	agent       *Agent
+	ctx         context.Context
+	maxParallel int
+	sem         chan struct{}
+	results     []ToolResult
+	safeBatch   []streamingPreparedTool
+}
+
+type streamingPreparedTool struct {
+	index    int
+	toolUse  ToolUse
+	prepared preparedToolExecution
+	done     chan ToolResult
+}
+
+func newStreamingToolScheduler(agent *Agent, ctx context.Context, maxParallel int) *streamingToolScheduler {
+	if maxParallel <= 0 {
+		maxParallel = defaultMaxParallelToolCalls
+	}
+	return &streamingToolScheduler{
+		agent:       agent,
+		ctx:         ctx,
+		maxParallel: maxParallel,
+		sem:         make(chan struct{}, maxParallel),
+		results:     make([]ToolResult, 0),
+	}
+}
+
+func (scheduler *streamingToolScheduler) add(toolUse ToolUse) {
+	index := len(scheduler.results)
+	scheduler.results = append(scheduler.results, ToolResult{ToolUse: toolUse})
+
+	prepared, err := scheduler.agent.prepareToolExecution(scheduler.ctx, toolUse.ToMap())
+	if err != nil {
+		scheduler.flushSafeBatch()
+		scheduler.results[index].Content = formatToolError(toolUse, err)
+		scheduler.results[index].IsError = true
+		return
+	}
+
+	if prepared.parallelSafe {
+		item := streamingPreparedTool{
+			index:    index,
+			toolUse:  toolUse,
+			prepared: prepared,
+			done:     make(chan ToolResult, 1),
+		}
+		scheduler.startSafeTool(item)
+		scheduler.safeBatch = append(scheduler.safeBatch, item)
+		return
+	}
+
+	scheduler.flushSafeBatch()
+	scheduler.agent.executePreparedToolIntoResult(prepared, &scheduler.results[index])
+}
+
+func (scheduler *streamingToolScheduler) finish() []ToolResult {
+	scheduler.flushSafeBatch()
+	return scheduler.results
+}
+
+func (scheduler *streamingToolScheduler) close() {
+	scheduler.flushSafeBatch()
+}
+
+func (scheduler *streamingToolScheduler) startSafeTool(item streamingPreparedTool) {
+	go func() {
+		result := ToolResult{ToolUse: item.toolUse}
+		select {
+		case <-scheduler.ctx.Done():
+			result.Content = formatToolError(item.toolUse, scheduler.ctx.Err())
+			result.IsError = true
+			item.done <- result
+			return
+		case scheduler.sem <- struct{}{}:
+		}
+		defer func() { <-scheduler.sem }()
+		scheduler.agent.executePreparedToolIntoResult(item.prepared, &result)
+		item.done <- result
+	}()
+}
+
+func (scheduler *streamingToolScheduler) flushSafeBatch() {
+	if len(scheduler.safeBatch) == 0 {
+		return
+	}
+	batch := scheduler.safeBatch
+	scheduler.safeBatch = nil
+
+	if scheduler.maxParallel <= 1 || len(batch) == 1 {
+		for _, item := range batch {
+			scheduler.results[item.index] = <-item.done
+		}
+		return
+	}
+
+	for _, item := range batch {
+		scheduler.results[item.index] = <-item.done
+	}
+}
+
+type toolExecutionBatch struct {
+	start    int
+	end      int
+	parallel bool
+}
+
+func buildToolExecutionBatches(preparedTools []preparedToolExecution, results []ToolResult) []toolExecutionBatch {
+	batches := make([]toolExecutionBatch, 0, len(preparedTools))
+	for i := 0; i < len(preparedTools); {
+		if results[i].IsError || !preparedTools[i].parallelSafe {
+			batches = append(batches, toolExecutionBatch{start: i, end: i + 1, parallel: false})
+			i++
+			continue
+		}
+		start := i
+		for i < len(preparedTools) && !results[i].IsError && preparedTools[i].parallelSafe {
+			i++
+		}
+		batches = append(batches, toolExecutionBatch{start: start, end: i, parallel: true})
+	}
+	return batches
+}
+
+func (agent *Agent) executePreparedToolBatch(ctx context.Context, toolUses []ToolUse, preparedTools []preparedToolExecution, results []ToolResult, start int, end int, maxParallel int) {
+	count := end - start
+	if count <= 0 {
+		return
+	}
+	if maxParallel <= 0 {
+		maxParallel = defaultMaxParallelToolCalls
+	}
+	if maxParallel > count {
+		maxParallel = count
+	}
+	if maxParallel <= 1 {
+		for i := start; i < end; i++ {
+			agent.executePreparedToolIntoResult(preparedTools[i], &results[i])
+		}
+		return
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxParallel)
+	for i := start; i < end; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				results[index].Content = formatToolError(toolUses[index], ctx.Err())
+				results[index].IsError = true
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+			agent.executePreparedToolIntoResult(preparedTools[index], &results[index])
+		}(i)
+	}
+	wg.Wait()
+}
+
+type preparedToolExecution struct {
+	toolUse          ToolUse
+	name             string
+	input            map[string]any
+	parallelSafe     bool
+	registry         *tool.Registry
+	enableToolBudget bool
+	toolBudget       ToolBudget
+}
+
+func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string]any) (preparedToolExecution, error) {
 	if toolUse == nil {
-		return "", errors.New("tool use is nil")
+		return preparedToolExecution{}, errors.New("tool use is nil")
 	}
 
 	name, ok := stringFromMap(toolUse, "name", "toolName", "tool_name")
 	if !ok || name == "" {
-		return "", errors.New("tool name is required")
+		return preparedToolExecution{}, errors.New("tool name is required")
 	}
 
 	input, err := toolInputFromMap(toolUse)
 	if err != nil {
-		return "", err
+		return preparedToolExecution{}, err
 	}
 
 	toolUseID, _ := stringFromMap(toolUse, "id", "toolUseID", "tool_use_id")
@@ -535,28 +835,66 @@ func (agent *Agent) ExecuteTool(ctx context.Context, toolUse map[string]any) (st
 	agent.mu.Unlock()
 
 	if registry == nil {
-		return "", errors.New("tool registry is nil")
+		return preparedToolExecution{}, errors.New("tool registry is nil")
 	}
 
+	permissionCheck := PermissionCheck{ParallelSafe: true}
 	if permission != nil {
-		if err := permission.Check(ctx, PermissionRequest{
+		check, err := permission.CheckWithResult(ctx, PermissionRequest{
 			ToolUseID: toolUseID,
 			ToolName:  name,
 			ToolInput: input,
-		}); err != nil {
-			return "", err
+		})
+		if err != nil {
+			return preparedToolExecution{}, err
 		}
+		permissionCheck = check
 	}
 
-	result, err := registry.Call(name, input)
+	return preparedToolExecution{
+		toolUse: ToolUse{
+			ID:    toolUseID,
+			Name:  name,
+			Input: mustMarshalToolInput(input),
+		},
+		name:             name,
+		input:            input,
+		parallelSafe:     permissionCheck.ParallelSafe,
+		registry:         registry,
+		enableToolBudget: enableToolBudget,
+		toolBudget:       toolBudget,
+	}, nil
+}
+
+func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution, result *ToolResult) {
+	content, err := agent.callPreparedTool(prepared)
+	if err != nil {
+		result.Content = formatToolError(result.ToolUse, err)
+		result.IsError = true
+		return
+	}
+	result.Content = content
+	result.IsError = false
+}
+
+func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, error) {
+	result, err := prepared.registry.Call(prepared.name, prepared.input)
 	if err != nil {
 		return "", err
 	}
 
-	if enableToolBudget {
-		return tool.TruncateToolResult(result, toolBudget.MaxLen, toolBudget.HeadLen, toolBudget.TailLen)
+	if prepared.enableToolBudget {
+		return tool.TruncateToolResult(result, prepared.toolBudget.MaxLen, prepared.toolBudget.HeadLen, prepared.toolBudget.TailLen)
 	}
 	return result, nil
+}
+
+func mustMarshalToolInput(input map[string]any) string {
+	data, err := json.Marshal(input)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func formatToolError(toolUse ToolUse, err error) string {

@@ -33,6 +33,7 @@ type RuntimeConfig struct {
 	Context          agent.ContextConfig
 	MaxLLMTurns      int
 	MaxToolCalls     int
+	MaxParallelTools int
 	MaxToolErrors    int
 	MaxAPIErrors     int
 	EnableToolBudget bool
@@ -67,6 +68,7 @@ func main() {
 		Model:                    cfg.ModelName,
 		MaxLLMTurns:              cfg.MaxLLMTurns,
 		MaxToolCalls:             cfg.MaxToolCalls,
+		MaxParallelToolCalls:     cfg.MaxParallelTools,
 		MaxConsecutiveToolErrors: cfg.MaxToolErrors,
 		MaxConsecutiveAPIErrors:  cfg.MaxAPIErrors,
 		EnableToolBudget:         cfg.EnableToolBudget,
@@ -171,6 +173,7 @@ func printHelp() {
 	fmt.Println("  /permission allow-deny        use tool allow/deny policy")
 	fmt.Println("  /permission full-auto         allow all tool calls")
 	fmt.Println("  /allow <tool>                 allow a tool in this session")
+	fmt.Println("  /allow *                      allow all tools in this session")
 	fmt.Println("  /deny <tool>                  deny a tool in this session")
 	fmt.Println("  /permissions                  show permission mode and policy")
 	fmt.Println("  /exit                         quit")
@@ -283,6 +286,7 @@ func printPermissionStatus(permissions *agent.PermissionManager) {
 	snapshot := permissions.Snapshot()
 	fmt.Printf("%spermission mode:%s %s\n", colorGray, colorReset, snapshot.Mode)
 	fmt.Printf("%sallowed tools:%s %s\n", colorGray, colorReset, strings.Join(snapshot.AllowedTools, ", "))
+	fmt.Printf("%sallowed commands:%s %s\n", colorGray, colorReset, strings.Join(snapshot.AllowedCommands, ", "))
 	fmt.Printf("%sdenied tools:%s %s\n", colorGray, colorReset, strings.Join(snapshot.DeniedTools, ", "))
 }
 
@@ -297,7 +301,11 @@ func tuiPermissionPrompt(scanner *bufio.Scanner) agent.PermissionAskFunc {
 		fmt.Println(colorDim + "Choose:" + colorReset)
 		fmt.Println("  1. Yes, allow once")
 		fmt.Println("  2. No, deny once")
-		fmt.Println("  3. Always allow this tool")
+		if request.ToolName == "bash" {
+			fmt.Println("  3. Always allow this command")
+		} else {
+			fmt.Println("  3. Always allow this tool")
+		}
 		fmt.Println("  4. Always deny this tool")
 		fmt.Print(colorDim + "Select option [1-4] > " + colorReset)
 
@@ -331,7 +339,7 @@ func tuiPermissionPrompt(scanner *bufio.Scanner) agent.PermissionAskFunc {
 			case "2":
 				return agent.PermissionDecisionDeny, "denied by user", nil
 			case "3":
-				return agent.PermissionDecisionAllowTool, "", nil
+				return agent.PermissionDecisionAllowRule, request.AllowRuleValue(), nil
 			case "4":
 				return agent.PermissionDecisionDenyTool, "denied by user", nil
 			default:
@@ -377,6 +385,7 @@ func loadRuntimeConfig(projectRoot string) (RuntimeConfig, string, error) {
 
 	cfg.MaxLLMTurns = intValue(values, "MAX_LLM_TURNS", 20)
 	cfg.MaxToolCalls = intValue(values, "MAX_TOOL_CALLS", 50)
+	cfg.MaxParallelTools = intValue(values, "MAX_PARALLEL_TOOL_CALLS", 4)
 	cfg.MaxToolErrors = intValue(values, "MAX_CONSECUTIVE_TOOL_ERRORS", 3)
 	cfg.MaxAPIErrors = intValue(values, "MAX_CONSECUTIVE_API_ERRORS", 3)
 

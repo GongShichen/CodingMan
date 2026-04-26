@@ -63,6 +63,12 @@ type ToolUse struct {
 	Input string
 }
 
+type ToolResult struct {
+	ToolUse ToolUse
+	Content string
+	IsError bool
+}
+
 func (toolUse ToolUse) ToMap() map[string]any {
 	return map[string]any{
 		"id":        toolUse.ID,
@@ -128,13 +134,14 @@ type ChatOptions struct {
 }
 
 type StreamEvent struct {
-	Text      string
-	Err       error
-	Done      bool
-	Type      string // text | tool_use_start | tool_use_delta | tool_use_end
-	ToolID    string
-	ToolName  string
-	ToolInput string
+	Text       string
+	Err        error
+	Done       bool
+	Type       string // text | tool_use_start | tool_use_delta | tool_use_end
+	ToolID     string
+	ToolCallID string
+	ToolName   string
+	ToolInput  string
 }
 
 type LLM interface {

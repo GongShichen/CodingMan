@@ -108,10 +108,11 @@ func (l *AnthropicLLM) Stream(ctx context.Context, messages []Message, opts Chat
 				activeToolUses[start.Index] = active
 
 				streamRes <- StreamEvent{
-					Type:      "tool_use",
-					ToolID:    toolUse.ID,
-					ToolName:  toolUse.Name,
-					ToolInput: string(toolUse.Input),
+					Type:       "tool_use",
+					ToolID:     toolUse.ID,
+					ToolCallID: toolUse.ID,
+					ToolName:   toolUse.Name,
+					ToolInput:  string(toolUse.Input),
 				}
 			case "content_block_delta":
 				deltaEvent := event.AsContentBlockDelta()
@@ -144,10 +145,11 @@ func (l *AnthropicLLM) Stream(ctx context.Context, messages []Message, opts Chat
 					continue
 				}
 				streamRes <- StreamEvent{
-					Type:      "tool_use_end",
-					ToolID:    active.ID,
-					ToolName:  active.Name,
-					ToolInput: active.builder.String(),
+					Type:       "tool_use_end",
+					ToolID:     active.ID,
+					ToolCallID: active.ID,
+					ToolName:   active.Name,
+					ToolInput:  active.builder.String(),
 				}
 				delete(activeToolUses, stop.Index)
 			}
