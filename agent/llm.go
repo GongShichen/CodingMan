@@ -133,6 +133,12 @@ type ChatOptions struct {
 	PromptCache PromptCacheConfig
 }
 
+type StreamRecoveryConfig struct {
+	Enabled    bool
+	MaxRetries int
+	Retry      RetryConfig
+}
+
 type StreamEvent struct {
 	Text       string
 	Err        error

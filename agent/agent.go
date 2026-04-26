@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
+	"time"
 
 	tool "github.com/GongShichen/CodingMan/tool"
 )
@@ -33,6 +35,8 @@ type Agent struct {
 	retryConfig              RetryConfig
 	permission               *PermissionManager
 	promptCache              PromptCacheConfig
+	enableStreamRecovery     bool
+	streamRecoveryMaxRetries int
 }
 
 type AgentConfig struct {
@@ -51,6 +55,8 @@ type AgentConfig struct {
 	RetryConfig              RetryConfig
 	Permission               PermissionConfig
 	PromptCache              PromptCacheConfig
+	EnableStreamRecovery     bool
+	StreamRecoveryMaxRetries int
 }
 
 type ToolBudget struct {
@@ -112,9 +118,21 @@ func NewAgent(config AgentConfig) *Agent {
 		retryConfig:              defaultRetryConfig(config.RetryConfig),
 		permission:               NewPermissionManager(permissionConfig),
 		promptCache:              normalizePromptCacheConfig(promptCacheConfig),
+		enableStreamRecovery:     true,
+		streamRecoveryMaxRetries: defaultStreamRecoveryMaxRetries(config.StreamRecoveryMaxRetries, config.RetryConfig.MaxRetries),
 	}
 
 	return agent
+}
+
+func defaultStreamRecoveryMaxRetries(value int, retryMaxRetries int) int {
+	if value > 0 {
+		return value
+	}
+	if retryMaxRetries > 0 {
+		return retryMaxRetries
+	}
+	return defaultMaxRetries
 }
 
 func defaultMaxTurnValue(value int, fallback int) int {
@@ -233,7 +251,10 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		model := agent.model
 		llm := agent.llm
 		tools := agent.currentToolsLocked()
+		retryConfig := agent.retryConfig
 		promptCache := agent.promptCache
+		enableStreamRecovery := agent.enableStreamRecovery
+		streamRecoveryMaxRetries := agent.streamRecoveryMaxRetries
 		agent.mu.Unlock()
 
 		resp, results, err := agent.runStreamingToolTurn(ctx, llm, messagesSnapshot, ChatOptions{
@@ -241,7 +262,11 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 			Model:       model,
 			Tools:       tools,
 			PromptCache: promptCache,
-		}, maxParallelToolCalls, maxToolCalls-toolCalls)
+		}, maxParallelToolCalls, maxToolCalls-toolCalls, StreamRecoveryConfig{
+			Enabled:    enableStreamRecovery,
+			MaxRetries: streamRecoveryMaxRetries,
+			Retry:      retryConfig,
+		})
 		if err != nil {
 			consecutiveAPIErrors++
 			if consecutiveAPIErrors >= maxConsecutiveAPIErrors {
@@ -312,29 +337,59 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 	llm := agent.llm
 	tools := agent.currentToolsLocked()
 	promptCache := agent.promptCache
+	retryConfig := agent.retryConfig
 	agent.mu.Unlock()
 
 	go func(messagesSnapshot []Message) {
 		defer close(streamRes)
 
 		var builder strings.Builder
-		stream := llm.Stream(ctx, messagesSnapshot, ChatOptions{
+		opts := ChatOptions{
 			System:      system,
 			Model:       model,
 			Tools:       tools,
 			PromptCache: promptCache,
-		})
+		}
+		retryConfig := defaultRetryConfig(retryConfig)
+		delay := retryConfig.InitialDelay
+		streamFailed := false
 
-		for event := range stream {
-			if event.Text != "" {
-				builder.WriteString(event.Text)
+		for attempt := 0; ; attempt++ {
+			emitted := false
+			stream := llm.Stream(ctx, messagesSnapshot, opts)
+			shouldRetry := false
+
+			for event := range stream {
+				if event.Err != nil {
+					if !emitted && attempt < retryConfig.MaxRetries && retryConfig.Retryable(event.Err) {
+						shouldRetry = true
+						break
+					}
+					streamFailed = true
+					streamRes <- event
+					break
+				}
+				if event.Text != "" {
+					builder.WriteString(event.Text)
+					emitted = true
+				}
+
+				streamRes <- event
 			}
-
-			streamRes <- event
-
-			if event.Err != nil {
+			if !shouldRetry {
+				break
+			}
+			if err := sleepWithContext(ctx, jitterDelay(delay, retryConfig.Jitter)); err != nil {
+				streamRes <- StreamEvent{Err: err, Done: true}
 				return
 			}
+			delay = time.Duration(math.Round(float64(delay) * retryConfig.Multiplier))
+			if delay > retryConfig.MaxDelay {
+				delay = retryConfig.MaxDelay
+			}
+		}
+		if streamFailed {
+			return
 		}
 
 		responseText := builder.String()
@@ -559,7 +614,47 @@ func (agent *Agent) ExecuteTools(ctx context.Context, toolUses []ToolUse, maxPar
 	return results
 }
 
-func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages []Message, opts ChatOptions, maxParallel int, maxToolCalls int) (LLMResponse, []ToolResult, error) {
+func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages []Message, opts ChatOptions, maxParallel int, maxToolCalls int, recovery StreamRecoveryConfig) (LLMResponse, []ToolResult, error) {
+	recovery.Retry = defaultRetryConfig(recovery.Retry)
+	if recovery.MaxRetries <= 0 {
+		recovery.MaxRetries = recovery.Retry.MaxRetries
+	}
+	if !recovery.Enabled {
+		recovery.MaxRetries = 0
+	}
+
+	var lastErr error
+	delay := recovery.Retry.InitialDelay
+	for attempt := 0; attempt <= recovery.MaxRetries; attempt++ {
+		resp, results, retryable, err := agent.runStreamingToolTurnAttempt(ctx, llm, messages, opts, maxParallel, maxToolCalls)
+		resp.RetryAttempts = attempt
+		if err == nil {
+			if attempt > 0 {
+				resp.StopReason = "stream_recovered"
+			}
+			return resp, results, nil
+		}
+		lastErr = err
+		if !retryable || attempt == recovery.MaxRetries || !recovery.Retry.Retryable(err) {
+			if resp.StopReason == "" {
+				resp.StopReason = "stream_interrupted"
+			}
+			resp.RetryAttempts = attempt
+			return resp, results, err
+		}
+		if err := sleepWithContext(ctx, jitterDelay(delay, recovery.Retry.Jitter)); err != nil {
+			return LLMResponse{StopReason: "stream_interrupted", RetryAttempts: attempt}, nil, err
+		}
+		delay = time.Duration(math.Round(float64(delay) * recovery.Retry.Multiplier))
+		if delay > recovery.Retry.MaxDelay {
+			delay = recovery.Retry.MaxDelay
+		}
+	}
+
+	return LLMResponse{StopReason: "stream_interrupted"}, nil, lastErr
+}
+
+func (agent *Agent) runStreamingToolTurnAttempt(ctx context.Context, llm LLM, messages []Message, opts ChatOptions, maxParallel int, maxToolCalls int) (LLMResponse, []ToolResult, bool, error) {
 	stream := llm.Stream(ctx, messages, opts)
 	scheduler := newStreamingToolScheduler(agent, ctx, maxParallel)
 	defer scheduler.close()
@@ -572,7 +667,15 @@ func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages 
 
 	for event := range stream {
 		if event.Err != nil {
-			return LLMResponse{}, nil, event.Err
+			if len(toolUses) > 0 {
+				results := scheduler.finish()
+				return LLMResponse{
+					Content:    content.String(),
+					StopReason: "stream_recovered",
+					ToolUses:   toolUses,
+				}, results, false, nil
+			}
+			return LLMResponse{StopReason: "stream_interrupted"}, nil, true, event.Err
 		}
 		if event.Text != "" {
 			content.WriteString(event.Text)
@@ -634,7 +737,7 @@ func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages 
 		Content:    content.String(),
 		StopReason: "completed",
 		ToolUses:   toolUses,
-	}, results, nil
+	}, results, false, nil
 }
 
 type streamingToolScheduler struct {

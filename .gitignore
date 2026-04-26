@@ -16,7 +16,6 @@ coverage.out
 # Local config and environment
 config.json
 .env
-.env.*
 
 # Editor and OS metadata
 .DS_Store
