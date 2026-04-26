@@ -84,7 +84,35 @@ func (l *OpenAILLM) Stream(ctx context.Context, messages []Message, opts ChatOpt
 			switch event.Type {
 			case "response.output_text.delta":
 				if delta := event.Delta; delta != "" {
-					ch <- StreamEvent{Text: delta}
+					ch <- StreamEvent{Type: "text", Text: delta}
+				}
+			case "response.output_item.added":
+				item := event.AsResponseOutputItemAdded().Item
+				if item.Type == "function_call" {
+					toolCall := item.AsFunctionCall()
+					ch <- StreamEvent{
+						Type:      "tool_use",
+						ToolID:    toolCall.CallID,
+						ToolName:  toolCall.Name,
+						ToolInput: toolCall.Arguments,
+					}
+				}
+			case "response.function_call_arguments.delta":
+				deltaEvent := event.AsResponseFunctionCallArgumentsDelta()
+				if deltaEvent.Delta != "" {
+					ch <- StreamEvent{
+						Type:      "tool_use_delta",
+						ToolID:    deltaEvent.ItemID,
+						ToolInput: deltaEvent.Delta,
+					}
+				}
+			case "response.function_call_arguments.done":
+				doneEvent := event.AsResponseFunctionCallArgumentsDone()
+				ch <- StreamEvent{
+					Type:      "tool_use_end",
+					ToolID:    doneEvent.ItemID,
+					ToolName:  doneEvent.Name,
+					ToolInput: doneEvent.Arguments,
 				}
 			case "error":
 				message := event.Message
@@ -224,23 +252,19 @@ func toOpenAIContentBlock(block ContentBlock) (responses.ResponseInputContentUni
 }
 
 func toOpenAITool(tool Tool) (responses.ToolUnionParam, error) {
-	name, ok := tool["name"].(string)
-	if !ok || name == "" {
+	name := tool.Name()
+	if name == "" {
 		return responses.ToolUnionParam{}, errors.New("tool.name is required")
 	}
 
-	parameters, ok := tool["input_schema"].(map[string]any)
-	if !ok {
+	parameters := tool.InputSchema()
+	if parameters == nil {
 		return responses.ToolUnionParam{}, errors.New("tool.input_schema must be an object")
 	}
 
 	strict := true
-	if v, ok := tool["strict"].(bool); ok {
-		strict = v
-	}
-
 	toolParam := responses.ToolParamOfFunction(name, parameters, strict)
-	if description, ok := tool["description"].(string); ok && description != "" {
+	if description := tool.Description(); description != "" {
 		if toolParam.OfFunction != nil {
 			toolParam.OfFunction.Description = param.NewOpt(description)
 		}

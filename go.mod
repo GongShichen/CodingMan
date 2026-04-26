@@ -2,7 +2,9 @@ module github.com/GongShichen/CodingMan
 
 go 1.26.0
 
-require agent v0.0.0
+require github.com/GongShichen/CodingMan/agent v0.0.0
+
+require github.com/GongShichen/CodingMan/tool v0.0.0 // indirect
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.37.0 // indirect
@@ -14,4 +16,6 @@ require (
 	golang.org/x/sync v0.20.0 // indirect
 )
 
-replace agent => ./agent
+replace github.com/GongShichen/CodingMan/agent => ./agent
+
+replace github.com/GongShichen/CodingMan/tool => ./tool

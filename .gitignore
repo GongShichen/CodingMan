@@ -1,6 +1,10 @@
 xsbin/
 bin/
 dist/
+
+# Go build artifacts
+CodingMan
+*.out
 coverage.out
 *.test
 *.exe
@@ -8,7 +12,16 @@ coverage.out
 *.dll
 *.so
 *.dylib
+
+# Local config and environment
 config.json
+.env
+.env.*
+
+# Editor and OS metadata
+.DS_Store
+.idea/
+.vscode/
 .idea/*.iml
 .idea/modules.xml
 .idea/workspace.xml

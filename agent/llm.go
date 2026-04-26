@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+
+	tool "github.com/GongShichen/CodingMan/tool"
 )
 
 const (
@@ -37,12 +39,15 @@ type ContentBlock struct {
 	Data      string
 	MediaType string
 	ImageURL  string
+	ToolId    string
 }
 
 type Message struct {
 	Role    string
 	Content []ContentBlock
 }
+
+type Tool = tool.Tool
 
 func TextBlock(text string) ContentBlock {
 	return ContentBlock{
@@ -66,8 +71,6 @@ func ImageURLBlock(imageURL string) ContentBlock {
 	}
 }
 
-type Tool map[string]any
-
 type ClientConfig struct {
 	APIKey  string
 	BaseURL string
@@ -78,13 +81,17 @@ type ChatOptions struct {
 	MaxTokens   int64
 	Temperature *float64
 	System      *string
-	Tools       []Tool
+	Tools       []tool.Tool
 }
 
 type StreamEvent struct {
-	Text string
-	Err  error
-	Done bool
+	Text      string
+	Err       error
+	Done      bool
+	Type      string // text | tool_use_start | tool_use_delta | tool_use_end
+	ToolID    string
+	ToolName  string
+	ToolInput string
 }
 
 type LLM interface {

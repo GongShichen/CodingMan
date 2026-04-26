@@ -76,18 +76,77 @@ func (l *AnthropicLLM) Stream(ctx context.Context, messages []Message, opts Chat
 			}
 		}()
 
+		type activeToolUse struct {
+			ID      string
+			Name    string
+			builder strings.Builder
+		}
+		activeToolUses := make(map[int64]*activeToolUse)
+
 		for stream.Next() {
 			event := stream.Current()
-			if event.Type != "content_block_delta" {
-				continue
-			}
+			switch event.Type {
+			case "content_block_start":
+				start := event.AsContentBlockStart()
+				block := start.ContentBlock
+				if block.Type != "tool_use" {
+					continue
+				}
 
-			delta := event.AsContentBlockDelta().Delta
-			if delta.Type != "text_delta" || delta.Text == "" {
-				continue
-			}
+				toolUse := block.AsToolUse()
+				active := &activeToolUse{
+					ID:   toolUse.ID,
+					Name: toolUse.Name,
+				}
+				if len(toolUse.Input) > 0 {
+					active.builder.Write(toolUse.Input)
+				}
+				activeToolUses[start.Index] = active
 
-			streamRes <- StreamEvent{Text: delta.Text}
+				streamRes <- StreamEvent{
+					Type:      "tool_use",
+					ToolID:    toolUse.ID,
+					ToolName:  toolUse.Name,
+					ToolInput: string(toolUse.Input),
+				}
+			case "content_block_delta":
+				deltaEvent := event.AsContentBlockDelta()
+				delta := deltaEvent.Delta
+
+				if delta.Type == "text_delta" && delta.Text != "" {
+					streamRes <- StreamEvent{Type: "text", Text: delta.Text}
+					continue
+				}
+
+				if delta.Type != "input_json_delta" {
+					continue
+				}
+
+				active, exists := activeToolUses[deltaEvent.Index]
+				if !exists {
+					continue
+				}
+				active.builder.WriteString(delta.PartialJSON)
+				streamRes <- StreamEvent{
+					Type:      "tool_use_delta",
+					ToolID:    active.ID,
+					ToolName:  active.Name,
+					ToolInput: delta.PartialJSON,
+				}
+			case "content_block_stop":
+				stop := event.AsContentBlockStop()
+				active, exists := activeToolUses[stop.Index]
+				if !exists {
+					continue
+				}
+				streamRes <- StreamEvent{
+					Type:      "tool_use_end",
+					ToolID:    active.ID,
+					ToolName:  active.Name,
+					ToolInput: active.builder.String(),
+				}
+				delete(activeToolUses, stop.Index)
+			}
 		}
 
 		if err := stream.Err(); err != nil {
@@ -203,13 +262,13 @@ func toAnthropicContentBlock(block ContentBlock) (anthropic.ContentBlockParamUni
 }
 
 func toAnthropicTool(tool Tool) (anthropic.ToolUnionParam, error) {
-	name, ok := tool["name"].(string)
-	if !ok || name == "" {
+	name := tool.Name()
+	if name == "" {
 		return anthropic.ToolUnionParam{}, errors.New("tool.name is required")
 	}
 
-	inputSchemaMap, ok := tool["input_schema"].(map[string]any)
-	if !ok {
+	inputSchemaMap := tool.InputSchema()
+	if inputSchemaMap == nil {
 		return anthropic.ToolUnionParam{}, errors.New("tool.input_schema must be an object")
 	}
 
@@ -236,7 +295,7 @@ func toAnthropicTool(tool Tool) (anthropic.ToolUnionParam, error) {
 	}
 
 	toolParam := anthropic.ToolUnionParamOfTool(schema, name)
-	if description, ok := tool["description"].(string); ok && description != "" {
+	if description := tool.Description(); description != "" {
 		if toolParam.OfTool != nil {
 			toolParam.OfTool.Description = param.NewOpt(description)
 		}

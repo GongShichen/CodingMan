@@ -3,13 +3,17 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+
+	tool "github.com/GongShichen/CodingMan/tool"
 )
 
 type Agent struct {
 	mu       sync.Mutex
 	llm      LLM
+	registry *tool.Registry
 	system   string
 	model    string
 	messages []Message
@@ -17,14 +21,21 @@ type Agent struct {
 }
 
 type AgentConfig struct {
-	LLM    LLM
-	System string
-	Model  string
+	LLM      LLM
+	Registry *tool.Registry
+	System   string
+	Model    string
 }
 
 func NewAgent(config AgentConfig) *Agent {
+	registry := config.Registry
+	if registry == nil {
+		registry = tool.NewDefaultRegistry()
+	}
+
 	agent := &Agent{
 		llm:      config.LLM,
+		registry: registry,
 		system:   config.System,
 		model:    config.Model,
 		messages: make([]Message, 0),
@@ -55,6 +66,14 @@ func NewAgentFromLLMConfig(llmConfig LLMConfig, system string, model string) (*A
 	}), nil
 }
 
+func (agent *Agent) HandleStreamEvent(event StreamEvent) {
+	if event.Type == "text" {
+		println(event.Text)
+	} else if event.Type == "tool_use_start" {
+		fmt.Printf("\033[90m[%s]\033[0m\n", event.ToolName)
+	}
+}
+
 func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBlock) (LLMResponse, error) {
 	if err := agent.appendUserMessage(prompt, blocks...); err != nil {
 		return LLMResponse{}, err
@@ -73,11 +92,13 @@ func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBl
 	messagesSnapshot := agent.snapshotMessagesLocked()
 	model := agent.model
 	llm := agent.llm
+	tools := agent.currentToolsLocked()
 	agent.mu.Unlock()
 
 	resp, err := llm.Chat(ctx, messagesSnapshot, ChatOptions{
 		System: system,
 		Model:  model,
+		Tools:  tools,
 	})
 	if err != nil {
 		return LLMResponse{StopReason: err.Error()}, err
@@ -122,6 +143,7 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 	messagesSnapshot := agent.snapshotMessagesLocked()
 	model := agent.model
 	llm := agent.llm
+	tools := agent.currentToolsLocked()
 	agent.mu.Unlock()
 
 	go func(messagesSnapshot []Message) {
@@ -131,6 +153,7 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 		stream := llm.Stream(ctx, messagesSnapshot, ChatOptions{
 			System: system,
 			Model:  model,
+			Tools:  tools,
 		})
 
 		for event := range stream {
@@ -199,6 +222,18 @@ func (agent *Agent) Messages() []Message {
 	return agent.snapshotMessagesLocked()
 }
 
+func (agent *Agent) Registry() *tool.Registry {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return agent.registry
+}
+
+func (agent *Agent) SetRegistry(registry *tool.Registry) {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.registry = registry
+}
+
 func (agent *Agent) snapshotMessagesLocked() []Message {
 	snapshot := make([]Message, 0, len(agent.messages))
 	for _, message := range agent.messages {
@@ -209,4 +244,11 @@ func (agent *Agent) snapshotMessagesLocked() []Message {
 		})
 	}
 	return snapshot
+}
+
+func (agent *Agent) currentToolsLocked() []tool.Tool {
+	if agent.registry == nil {
+		return nil
+	}
+	return agent.registry.Tools()
 }
