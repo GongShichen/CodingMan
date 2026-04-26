@@ -488,6 +488,34 @@ func (agent *Agent) Clear() {
 	agent.messages = agent.messages[:0]
 }
 
+func (agent *Agent) SystemPrompt() string {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return agent.system
+}
+
+func (agent *Agent) SetBaseSystemPrompt(baseSystem string) error {
+	if strings.TrimSpace(baseSystem) == "" {
+		return errors.New("system prompt must not be empty")
+	}
+
+	agent.mu.Lock()
+	contextConfig := agent.contextConfig
+	contextConfig.BaseSystem = baseSystem
+	agent.mu.Unlock()
+
+	system, err := BuildSystemPromptWithConfig(contextConfig)
+	if err != nil {
+		return err
+	}
+
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.contextConfig = normalizeContextConfig(contextConfig)
+	agent.system = system
+	return nil
+}
+
 func (agent *Agent) appendUserMessage(text string, blocks ...ContentBlock) error {
 	content := make([]ContentBlock, 0, len(blocks)+1)
 	if text != "" {

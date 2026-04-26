@@ -52,12 +52,16 @@ type RuntimeConfig struct {
 }
 
 func main() {
+	launchDir, err := os.Getwd()
+	if err != nil {
+		fatal("get working directory", err)
+	}
 	projectRoot, err := findProjectRoot(".")
 	if err != nil {
 		fatal("find project root", err)
 	}
 
-	cfg, source, err := loadRuntimeConfig(projectRoot)
+	cfg, source, err := loadRuntimeConfig(projectRoot, launchDir)
 	if err != nil {
 		fatal("load config", err)
 	}
@@ -207,6 +211,7 @@ func printHelp() {
 	fmt.Println("  /cache                        show prompt cache status")
 	fmt.Println("  /cache on                     enable prompt cache")
 	fmt.Println("  /cache off                    disable prompt cache")
+	fmt.Println("  /system <path>                load system prompt from file")
 	fmt.Println("  /permission                   show permission mode and policy")
 	fmt.Println("  /permission ask               ask before tool calls")
 	fmt.Println("  /permission allow-deny        use tool allow/deny policy")
@@ -226,6 +231,8 @@ func handleSlashCommand(a *agent.Agent, prompt string) bool {
 	}
 
 	switch fields[0] {
+	case "/system":
+		return handleSystemCommand(a, fields)
 	case "/permission":
 		permissions := a.Permission()
 		if permissions == nil {
@@ -282,6 +289,44 @@ func handleSlashCommand(a *agent.Agent, prompt string) bool {
 	default:
 		return false
 	}
+}
+
+func handleSystemCommand(a *agent.Agent, fields []string) bool {
+	if len(fields) != 2 {
+		fmt.Println(colorRed + "usage: /system <system_prompt_path>" + colorReset)
+		return true
+	}
+	path := expandHome(fields[1])
+	if !filepath.IsAbs(path) {
+		abs, err := filepath.Abs(path)
+		if err == nil {
+			path = abs
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+		return true
+	}
+	if info.IsDir() {
+		fmt.Printf("%serror:%s system prompt path is a directory: %s\n", colorRed, colorReset, path)
+		return true
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+		return true
+	}
+	if strings.TrimSpace(string(content)) == "" {
+		fmt.Println(colorRed + "error: system prompt file is empty" + colorReset)
+		return true
+	}
+	if err := a.SetBaseSystemPrompt(string(content)); err != nil {
+		fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+		return true
+	}
+	fmt.Printf("%ssystem prompt loaded:%s %s\n", colorGray, colorReset, path)
+	return true
 }
 
 func handleCacheCommand(a *agent.Agent, fields []string) bool {
@@ -644,7 +689,7 @@ func expandHome(path string) string {
 	return path
 }
 
-func loadRuntimeConfig(projectRoot string) (RuntimeConfig, string, error) {
+func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, string, error) {
 	envPath := filepath.Join(projectRoot, ".env")
 	values := map[string]string{}
 	source := "environment"
@@ -669,7 +714,7 @@ func loadRuntimeConfig(projectRoot string) (RuntimeConfig, string, error) {
 		BaseURL:   strings.TrimSpace(values["BASE_URL"]),
 		Context:   agent.DefaultContextConfig(),
 	}
-	cfg.Context.Cwd = valueOrDefault(values["CWD"], projectRoot)
+	cfg.Context.Cwd = valueOrDefault(values["CWD"], launchDir)
 	cfg.Context.BaseSystem = values["BASE_SYSTEM"]
 	cfg.Context.IncludeDate = boolValue(values, "INCLUDE_DATE", cfg.Context.IncludeDate)
 	cfg.Context.LoadAgentsMD = boolValue(values, "LOAD_AGENTS_MD", cfg.Context.LoadAgentsMD)

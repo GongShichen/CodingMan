@@ -47,6 +47,24 @@ func (llm *fakeLLM) Stream(ctx context.Context, messages []agent.Message, opts a
 	return ch
 }
 
+func TestDefaultAndCustomSystemPrompt(t *testing.T) {
+	a := agent.NewAgent(agent.AgentConfig{LLM: &fakeLLM{}})
+	if !strings.Contains(a.SystemPrompt(), "You are CodingMan") {
+		t.Fatalf("default coding system prompt missing:\n%s", a.SystemPrompt())
+	}
+
+	if err := a.SetBaseSystemPrompt("custom coding policy"); err != nil {
+		t.Fatal(err)
+	}
+	system := a.SystemPrompt()
+	if !strings.Contains(system, "custom coding policy") {
+		t.Fatalf("custom system prompt missing:\n%s", system)
+	}
+	if !strings.Contains(system, "工作目录:") {
+		t.Fatalf("context metadata missing after custom system prompt:\n%s", system)
+	}
+}
+
 func TestToolErrorPreservesOutput(t *testing.T) {
 	llm := &fakeLLM{}
 	llm.streamFn = func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
