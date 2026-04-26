@@ -140,19 +140,27 @@ type StreamRecoveryConfig struct {
 }
 
 type StreamEvent struct {
-	Text       string
-	Err        error
-	Done       bool
-	Type       string // text | tool_use_start | tool_use_delta | tool_use_end
-	ToolID     string
-	ToolCallID string
-	ToolName   string
-	ToolInput  string
+	Text                     string
+	Err                      error
+	Done                     bool
+	Type                     string // text | tool_use_start | tool_use_delta | tool_use_end | usage
+	ToolID                   string
+	ToolCallID               string
+	ToolName                 string
+	ToolInput                string
+	InputTokens              int
+	OutputTokens             int
+	CachedInputTokens        int
+	CacheCreationInputTokens int
 }
 
 type LLM interface {
 	Chat(ctx context.Context, messages []Message, opts ChatOptions) (LLMResponse, error)
 	Stream(ctx context.Context, messages []Message, opts ChatOptions) <-chan StreamEvent
+}
+
+type LoggerAware interface {
+	SetLogger(Logger)
 }
 
 func CreateLLM(config LLMConfig) (LLM, error) {

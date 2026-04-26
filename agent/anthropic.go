@@ -1,10 +1,13 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
@@ -18,7 +21,11 @@ const (
 )
 
 type AnthropicLLM struct {
-	client anthropic.Client
+	client      anthropic.Client
+	apiKey      string
+	baseURL     string
+	useMessages bool
+	logger      Logger
 }
 
 func NewAnthropicLLM(config ClientConfig, opts ...anthropicoption.RequestOption) *AnthropicLLM {
@@ -30,7 +37,11 @@ func NewAnthropicLLM(config ClientConfig, opts ...anthropicoption.RequestOption)
 	}
 
 	return &AnthropicLLM{
-		client: anthropic.NewClient(opts...),
+		client:      anthropic.NewClient(opts...),
+		apiKey:      config.APIKey,
+		baseURL:     strings.TrimRight(config.BaseURL, "/"),
+		useMessages: strings.TrimSpace(config.BaseURL) != "",
+		logger:      noopLogger{},
 	}
 }
 
@@ -38,16 +49,32 @@ func (l *AnthropicLLM) Client() anthropic.Client {
 	return l.client
 }
 
+func (l *AnthropicLLM) SetLogger(logger Logger) {
+	if logger == nil {
+		logger = noopLogger{}
+	}
+	l.logger = logger
+}
+
 func (l *AnthropicLLM) Chat(ctx context.Context, messages []Message, opts ChatOptions) (LLMResponse, error) {
+	traceID := TraceIDFromContext(ctx)
+	if l.useMessages {
+		return l.messages(ctx, messages, opts)
+	}
+
 	params, err := buildAnthropicMessageParams(messages, opts)
 	if err != nil {
+		l.log(traceID, "anthropic sdk chat build_params error=%v", err)
 		return LLMResponse{}, err
 	}
 
+	l.log(traceID, "anthropic sdk chat request model=%s messages=%d tools=%d", opts.Model, len(messages), len(opts.Tools))
 	resp, err := l.client.Messages.New(ctx, params)
 	if err != nil {
+		l.log(traceID, "anthropic sdk chat network_error=%+v", err)
 		return LLMResponse{}, err
 	}
+	l.log(traceID, "anthropic sdk chat response stop=%s input=%d output=%d", resp.StopReason, resp.Usage.InputTokens, resp.Usage.OutputTokens)
 
 	return LLMResponse{
 		Content:                  extractAnthropicText(resp.Content),
@@ -63,16 +90,55 @@ func (l *AnthropicLLM) Chat(ctx context.Context, messages []Message, opts ChatOp
 
 func (l *AnthropicLLM) Stream(ctx context.Context, messages []Message, opts ChatOptions) <-chan StreamEvent {
 	streamRes := make(chan StreamEvent)
+	traceID := TraceIDFromContext(ctx)
 
 	go func() {
 		defer close(streamRes)
 
+		if l.useMessages {
+			resp, err := l.messages(ctx, messages, opts)
+			if err != nil {
+				streamRes <- StreamEvent{Err: err, Done: true}
+				return
+			}
+			if resp.Content != "" {
+				streamRes <- StreamEvent{Type: "text", Text: resp.Content}
+			}
+			for _, toolUse := range resp.ToolUses {
+				streamRes <- StreamEvent{
+					Type:       "tool_use",
+					ToolID:     toolUse.ID,
+					ToolCallID: toolUse.ID,
+					ToolName:   toolUse.Name,
+					ToolInput:  toolUse.Input,
+				}
+				streamRes <- StreamEvent{
+					Type:       "tool_use_end",
+					ToolID:     toolUse.ID,
+					ToolCallID: toolUse.ID,
+					ToolName:   toolUse.Name,
+					ToolInput:  toolUse.Input,
+				}
+			}
+			streamRes <- StreamEvent{
+				Type:                     "usage",
+				InputTokens:              resp.InputTokens,
+				OutputTokens:             resp.OutputTokens,
+				CachedInputTokens:        resp.CachedInputTokens,
+				CacheCreationInputTokens: resp.CacheCreationInputTokens,
+			}
+			streamRes <- StreamEvent{Done: true}
+			return
+		}
+
 		params, err := buildAnthropicMessageParams(messages, opts)
 		if err != nil {
+			l.log(traceID, "anthropic sdk stream build_params error=%v", err)
 			streamRes <- StreamEvent{Err: err, Done: true}
 			return
 		}
 
+		l.log(traceID, "anthropic sdk stream request model=%s messages=%d tools=%d", opts.Model, len(messages), len(opts.Tools))
 		stream := l.client.Messages.NewStreaming(ctx, params)
 		defer func() {
 			if err := stream.Close(); err != nil {
@@ -90,6 +156,25 @@ func (l *AnthropicLLM) Stream(ctx context.Context, messages []Message, opts Chat
 		for stream.Next() {
 			event := stream.Current()
 			switch event.Type {
+			case "message_start":
+				start := event.AsMessageStart()
+				usage := start.Message.Usage
+				streamRes <- StreamEvent{
+					Type:                     "usage",
+					InputTokens:              int(usage.InputTokens),
+					OutputTokens:             int(usage.OutputTokens),
+					CachedInputTokens:        int(usage.CacheReadInputTokens),
+					CacheCreationInputTokens: int(usage.CacheCreationInputTokens),
+				}
+			case "message_delta":
+				delta := event.AsMessageDelta()
+				streamRes <- StreamEvent{
+					Type:                     "usage",
+					InputTokens:              int(delta.Usage.InputTokens),
+					OutputTokens:             int(delta.Usage.OutputTokens),
+					CachedInputTokens:        int(delta.Usage.CacheReadInputTokens),
+					CacheCreationInputTokens: int(delta.Usage.CacheCreationInputTokens),
+				}
 			case "content_block_start":
 				start := event.AsContentBlockStart()
 				block := start.ContentBlock
@@ -156,14 +241,314 @@ func (l *AnthropicLLM) Stream(ctx context.Context, messages []Message, opts Chat
 		}
 
 		if err := stream.Err(); err != nil {
+			l.log(traceID, "anthropic sdk stream network_error=%+v", err)
 			streamRes <- StreamEvent{Err: err, Done: true}
 			return
 		}
 
+		l.log(traceID, "anthropic sdk stream completed")
 		streamRes <- StreamEvent{Done: true}
 	}()
 
 	return streamRes
+}
+
+func (l *AnthropicLLM) log(traceID string, format string, args ...any) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	l.logger.Log(traceID, format, args...)
+}
+
+type anthropicMessageRequest struct {
+	Model       string                   `json:"model"`
+	MaxTokens   int64                    `json:"max_tokens"`
+	System      string                   `json:"system,omitempty"`
+	Messages    []anthropicCompatMessage `json:"messages"`
+	Tools       []anthropicCompatTool    `json:"tools,omitempty"`
+	Temperature *float64                 `json:"temperature,omitempty"`
+}
+
+type anthropicCompatMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}
+
+type anthropicCompatContentBlock struct {
+	Type      string                      `json:"type"`
+	Text      string                      `json:"text,omitempty"`
+	ID        string                      `json:"id,omitempty"`
+	Name      string                      `json:"name,omitempty"`
+	Input     json.RawMessage             `json:"input,omitempty"`
+	ToolUseID string                      `json:"tool_use_id,omitempty"`
+	Content   string                      `json:"content,omitempty"`
+	IsError   bool                        `json:"is_error,omitempty"`
+	Source    *anthropicCompatImageSource `json:"source,omitempty"`
+}
+
+type anthropicCompatImageSource struct {
+	Type      string `json:"type"`
+	URL       string `json:"url,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+}
+
+type anthropicCompatTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	InputSchema map[string]any `json:"input_schema"`
+}
+
+type anthropicMessageResponse struct {
+	ID         string                        `json:"id"`
+	Model      string                        `json:"model"`
+	StopReason string                        `json:"stop_reason"`
+	Content    []anthropicCompatContentBlock `json:"content"`
+	Usage      struct {
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	} `json:"usage"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error"`
+}
+
+func (l *AnthropicLLM) messages(ctx context.Context, messages []Message, opts ChatOptions) (LLMResponse, error) {
+	traceID := TraceIDFromContext(ctx)
+	if l.baseURL == "" {
+		return LLMResponse{}, errors.New("anthropic-compatible base url is required")
+	}
+	requestBody, err := buildAnthropicCompatRequest(messages, opts)
+	if err != nil {
+		l.log(traceID, "anthropic messages build_request error=%v", err)
+		return LLMResponse{}, err
+	}
+
+	data, err := json.Marshal(requestBody)
+	if err != nil {
+		return LLMResponse{}, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.baseURL+"/messages", bytes.NewReader(data))
+	if err != nil {
+		l.log(traceID, "anthropic messages new_request error=%v", err)
+		return LLMResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if l.apiKey != "" {
+		req.Header.Set("x-api-key", l.apiKey)
+		req.Header.Set("Authorization", "Bearer "+l.apiKey)
+	}
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	l.log(traceID, "anthropic messages request endpoint=%s model=%s messages=%d tools=%d", l.baseURL+"/messages", requestBody.Model, len(requestBody.Messages), len(requestBody.Tools))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		l.log(traceID, "anthropic messages network_error=%+v", err)
+		return LLMResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		l.log(traceID, "anthropic messages read_body error=%+v", err)
+		return LLMResponse{}, err
+	}
+	l.log(traceID, "anthropic messages raw_response status=%d body=%s", resp.StatusCode, string(respData))
+
+	var decoded anthropicMessageResponse
+	if err := json.Unmarshal(respData, &decoded); err != nil {
+		l.log(traceID, "anthropic messages decode_error status=%d error=%+v body=%s", resp.StatusCode, err, string(respData))
+		return LLMResponse{}, fmt.Errorf("decode anthropic message response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(string(respData))
+		if decoded.Error != nil && decoded.Error.Message != "" {
+			message = decoded.Error.Message
+		}
+		l.log(traceID, "anthropic messages response_error status=%d message=%s", resp.StatusCode, message)
+		return LLMResponse{StopReason: message, Raw: decoded}, fmt.Errorf("anthropic messages request failed: status=%d message=%s", resp.StatusCode, message)
+	}
+
+	l.log(traceID, "anthropic messages response status=%d stop=%s input=%d output=%d tools=%d", resp.StatusCode, decoded.StopReason, decoded.Usage.InputTokens, decoded.Usage.OutputTokens, len(extractAnthropicCompatToolUses(decoded.Content)))
+	return LLMResponse{
+		Content:                  extractAnthropicCompatText(decoded.Content),
+		InputTokens:              decoded.Usage.InputTokens,
+		OutputTokens:             decoded.Usage.OutputTokens,
+		CachedInputTokens:        decoded.Usage.CacheReadInputTokens,
+		CacheCreationInputTokens: decoded.Usage.CacheCreationInputTokens,
+		StopReason:               decoded.StopReason,
+		ToolUses:                 extractAnthropicCompatToolUses(decoded.Content),
+		Raw:                      decoded,
+	}, nil
+}
+
+func buildAnthropicCompatRequest(messages []Message, opts ChatOptions) (anthropicMessageRequest, error) {
+	model := opts.Model
+	if model == "" {
+		model = string(defaultAnthropicModel)
+	}
+	maxTokens := opts.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = defaultAnthropicMaxTokens
+	}
+
+	convertedMessages := make([]anthropicCompatMessage, 0, len(messages))
+	for _, message := range messages {
+		converted, err := toAnthropicCompatMessage(message)
+		if err != nil {
+			return anthropicMessageRequest{}, err
+		}
+		convertedMessages = append(convertedMessages, converted)
+	}
+
+	tools := make([]anthropicCompatTool, 0, len(opts.Tools))
+	for _, tool := range opts.Tools {
+		converted, err := toAnthropicCompatTool(tool)
+		if err != nil {
+			return anthropicMessageRequest{}, err
+		}
+		tools = append(tools, converted)
+	}
+
+	request := anthropicMessageRequest{
+		Model:       model,
+		MaxTokens:   maxTokens,
+		Messages:    convertedMessages,
+		Tools:       tools,
+		Temperature: opts.Temperature,
+	}
+	if opts.System != nil {
+		request.System = *opts.System
+	}
+	return request, nil
+}
+
+func toAnthropicCompatMessage(message Message) (anthropicCompatMessage, error) {
+	role := strings.ToLower(message.Role)
+	if role == "" {
+		return anthropicCompatMessage{}, errors.New("message role is required")
+	}
+	if role != "user" && role != "assistant" {
+		return anthropicCompatMessage{}, fmt.Errorf("unsupported anthropic message role: %s", message.Role)
+	}
+
+	blocks, err := toAnthropicCompatContent(message.Content)
+	if err != nil {
+		return anthropicCompatMessage{}, err
+	}
+	return anthropicCompatMessage{
+		Role:    role,
+		Content: blocks,
+	}, nil
+}
+
+func toAnthropicCompatContent(blocks []ContentBlock) ([]anthropicCompatContentBlock, error) {
+	if len(blocks) == 0 {
+		return nil, errors.New("message content must not be empty")
+	}
+
+	result := make([]anthropicCompatContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Type {
+		case ContentTypeText:
+			if block.Text == "" {
+				return nil, errors.New("text block requires text")
+			}
+			result = append(result, anthropicCompatContentBlock{
+				Type: "text",
+				Text: block.Text,
+			})
+		case ContentTypeImage:
+			source := &anthropicCompatImageSource{}
+			if block.ImageURL != "" {
+				source.Type = "url"
+				source.URL = block.ImageURL
+			} else {
+				if block.Data == "" || block.MediaType == "" {
+					return nil, errors.New("image block requires image url or data/media type")
+				}
+				source.Type = "base64"
+				source.MediaType = block.MediaType
+				source.Data = block.Data
+			}
+			result = append(result, anthropicCompatContentBlock{
+				Type:   "image",
+				Source: source,
+			})
+		case ContentTypeToolUse:
+			if block.ToolID == "" || block.ToolName == "" {
+				return nil, errors.New("tool_use block requires tool id and name")
+			}
+			input := json.RawMessage(`{}`)
+			if block.ToolInput != "" {
+				input = json.RawMessage(block.ToolInput)
+			}
+			result = append(result, anthropicCompatContentBlock{
+				Type:  "tool_use",
+				ID:    block.ToolID,
+				Name:  block.ToolName,
+				Input: input,
+			})
+		case ContentTypeToolResult:
+			if block.ToolID == "" {
+				return nil, errors.New("tool_result block requires tool id")
+			}
+			result = append(result, anthropicCompatContentBlock{
+				Type:      "tool_result",
+				ToolUseID: block.ToolID,
+				Content:   block.Text,
+				IsError:   block.IsError,
+			})
+		default:
+			return nil, fmt.Errorf("unsupported content block type: %s", block.Type)
+		}
+	}
+	return result, nil
+}
+
+func toAnthropicCompatTool(tool Tool) (anthropicCompatTool, error) {
+	name := tool.Name()
+	if name == "" {
+		return anthropicCompatTool{}, errors.New("tool.name is required")
+	}
+	inputSchema := tool.InputSchema()
+	if inputSchema == nil {
+		return anthropicCompatTool{}, errors.New("tool.input_schema must be an object")
+	}
+	return anthropicCompatTool{
+		Name:        name,
+		Description: tool.Description(),
+		InputSchema: inputSchema,
+	}, nil
+}
+
+func extractAnthropicCompatText(blocks []anthropicCompatContentBlock) string {
+	var builder strings.Builder
+	for _, block := range blocks {
+		if block.Type == "text" {
+			builder.WriteString(block.Text)
+		}
+	}
+	return builder.String()
+}
+
+func extractAnthropicCompatToolUses(blocks []anthropicCompatContentBlock) []ToolUse {
+	toolUses := make([]ToolUse, 0)
+	for _, block := range blocks {
+		if block.Type != "tool_use" {
+			continue
+		}
+		toolUses = append(toolUses, ToolUse{
+			ID:    block.ID,
+			Name:  block.Name,
+			Input: string(block.Input),
+		})
+	}
+	return toolUses
 }
 
 func buildAnthropicMessageParams(messages []Message, opts ChatOptions) (anthropic.MessageNewParams, error) {

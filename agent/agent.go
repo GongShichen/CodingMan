@@ -37,6 +37,7 @@ type Agent struct {
 	promptCache              PromptCacheConfig
 	enableStreamRecovery     bool
 	streamRecoveryMaxRetries int
+	logger                   Logger
 }
 
 type AgentConfig struct {
@@ -55,8 +56,9 @@ type AgentConfig struct {
 	RetryConfig              RetryConfig
 	Permission               PermissionConfig
 	PromptCache              PromptCacheConfig
-	EnableStreamRecovery     bool
+	EnableStreamRecovery     *bool
 	StreamRecoveryMaxRetries int
+	Logger                   Logger
 }
 
 type ToolBudget struct {
@@ -97,6 +99,13 @@ func NewAgent(config AgentConfig) *Agent {
 	if isZeroPermissionConfig(permissionConfig) {
 		permissionConfig = DefaultPermissionConfig()
 	}
+	logger := config.Logger
+	if logger == nil {
+		logger = noopLogger{}
+	}
+	if loggerAware, ok := config.LLM.(LoggerAware); ok {
+		loggerAware.SetLogger(logger)
+	}
 
 	agent := &Agent{
 		llm:                      config.LLM,
@@ -118,8 +127,9 @@ func NewAgent(config AgentConfig) *Agent {
 		retryConfig:              defaultRetryConfig(config.RetryConfig),
 		permission:               NewPermissionManager(permissionConfig),
 		promptCache:              normalizePromptCacheConfig(promptCacheConfig),
-		enableStreamRecovery:     true,
+		enableStreamRecovery:     defaultBool(config.EnableStreamRecovery, true),
 		streamRecoveryMaxRetries: defaultStreamRecoveryMaxRetries(config.StreamRecoveryMaxRetries, config.RetryConfig.MaxRetries),
+		logger:                   logger,
 	}
 
 	return agent
@@ -133,6 +143,13 @@ func defaultStreamRecoveryMaxRetries(value int, retryMaxRetries int) int {
 		return retryMaxRetries
 	}
 	return defaultMaxRetries
+}
+
+func defaultBool(value *bool, defaultValue bool) bool {
+	if value == nil {
+		return defaultValue
+	}
+	return *value
 }
 
 func defaultMaxTurnValue(value int, fallback int) int {
@@ -173,15 +190,43 @@ func (agent *Agent) HandleStreamEvent(event StreamEvent) {
 	}
 }
 
+func (agent *Agent) SetLogger(logger Logger) {
+	if logger == nil {
+		logger = noopLogger{}
+	}
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.logger = logger
+	if loggerAware, ok := agent.llm.(LoggerAware); ok {
+		loggerAware.SetLogger(logger)
+	}
+}
+
+func (agent *Agent) log(traceID string, format string, args ...any) {
+	agent.mu.Lock()
+	logger := agent.logger
+	agent.mu.Unlock()
+	if logger == nil {
+		return
+	}
+	logger.Log(traceID, format, args...)
+}
+
 func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBlock) (LLMResponse, error) {
+	ctx, traceID := ensureTrace(ctx)
+	agent.log(traceID, "chat start prompt_chars=%d blocks=%d", len(prompt), len(blocks))
+	agent.log(traceID, "user message:\n%s", formatContentForLog(prompt, blocks))
+	defer agent.log(traceID, "chat end")
 	if err := agent.appendUserMessage(prompt, blocks...); err != nil {
+		agent.log(traceID, "chat append_user error=%v", err)
 		return LLMResponse{}, err
 	}
-	agent.autoCompactMessagesIfNeeded()
+	agent.autoCompactMessagesIfNeeded(ctx)
 
 	agent.mu.Lock()
 	if agent.llm == nil {
 		agent.mu.Unlock()
+		agent.log(traceID, "chat error=agent llm is nil")
 		return LLMResponse{StopReason: "agent is nil"}, errors.New("agent llm is nil")
 	}
 
@@ -196,6 +241,7 @@ func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBl
 	retryConfig := agent.retryConfig
 	promptCache := agent.promptCache
 	agent.mu.Unlock()
+	agent.log(traceID, "chat llm_request model=%s messages=%d tools=%d", model, len(messagesSnapshot), len(tools))
 
 	resp, err := retryChat(ctx, llm, messagesSnapshot, ChatOptions{
 		System:      system,
@@ -204,8 +250,11 @@ func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBl
 		PromptCache: promptCache,
 	}, retryConfig)
 	if err != nil {
+		agent.log(traceID, "chat llm_error retry=%d error=%v", resp.RetryAttempts, err)
 		return LLMResponse{StopReason: err.Error()}, err
 	}
+	agent.log(traceID, "chat llm_response stop=%s input=%d output=%d tools=%d retry=%d", resp.StopReason, resp.InputTokens, resp.OutputTokens, len(resp.ToolUses), resp.RetryAttempts)
+	agent.log(traceID, "assistant message:\n%s", formatAssistantResponseForLog(resp))
 
 	agent.appendAssistantMessage(resp.Content)
 
@@ -213,7 +262,11 @@ func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBl
 }
 
 func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...ContentBlock) (LLMResponse, error) {
+	ctx, traceID := ensureTrace(ctx)
+	agent.log(traceID, "tool_loop start prompt_chars=%d blocks=%d", len(prompt), len(blocks))
+	agent.log(traceID, "user message:\n%s", formatContentForLog(prompt, blocks))
 	if err := agent.appendUserMessage(prompt, blocks...); err != nil {
+		agent.log(traceID, "tool_loop append_user error=%v", err)
 		return LLMResponse{}, err
 	}
 
@@ -229,17 +282,20 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		maxConsecutiveAPIErrors := agent.maxConsecutiveAPIErrors
 		agent.mu.Unlock()
 		if llmTurn >= maxTurn {
+			agent.log(traceID, "tool_loop stop=maxturns turn=%d max=%d", llmTurn, maxTurn)
 			return LLMResponse{StopReason: "maxturns"}, nil
 		}
 		if toolCalls >= maxToolCalls {
+			agent.log(traceID, "tool_loop stop=maxtoolcalls count=%d max=%d", toolCalls, maxToolCalls)
 			return LLMResponse{StopReason: "maxtoolcalls"}, nil
 		}
 
-		agent.autoCompactMessagesIfNeeded()
+		agent.autoCompactMessagesIfNeeded(ctx)
 
 		agent.mu.Lock()
 		if agent.llm == nil {
 			agent.mu.Unlock()
+			agent.log(traceID, "tool_loop error=agent llm is nil")
 			return LLMResponse{StopReason: "agent is nil"}, errors.New("agent llm is nil")
 		}
 
@@ -256,6 +312,7 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		enableStreamRecovery := agent.enableStreamRecovery
 		streamRecoveryMaxRetries := agent.streamRecoveryMaxRetries
 		agent.mu.Unlock()
+		agent.log(traceID, "tool_loop llm_turn=%d request model=%s messages=%d tools=%d tool_calls=%d", llmTurn, model, len(messagesSnapshot), len(tools), toolCalls)
 
 		resp, results, err := agent.runStreamingToolTurn(ctx, llm, messagesSnapshot, ChatOptions{
 			System:      system,
@@ -269,7 +326,9 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		})
 		if err != nil {
 			consecutiveAPIErrors++
+			agent.log(traceID, "tool_loop llm_turn=%d api_error consecutive=%d max=%d error=%v", llmTurn, consecutiveAPIErrors, maxConsecutiveAPIErrors, err)
 			if consecutiveAPIErrors >= maxConsecutiveAPIErrors {
+				agent.log(traceID, "tool_loop stop=apierrors")
 				return LLMResponse{
 					StopReason: "apierrors",
 				}, err
@@ -279,14 +338,21 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		consecutiveAPIErrors = 0
 
 		agent.appendAssistantResponse(resp)
+		agent.log(traceID, "tool_loop llm_turn=%d response stop=%s input=%d output=%d tools=%d retry=%d", llmTurn, resp.StopReason, resp.InputTokens, resp.OutputTokens, len(resp.ToolUses), resp.RetryAttempts)
+		agent.log(traceID, "assistant message:\n%s", formatAssistantResponseForLog(resp))
 
 		toolUses := resp.ToolUses
 		if len(toolUses) == 0 {
+			agent.log(traceID, "tool_loop completed turns=%d total_tool_calls=%d", llmTurn+1, toolCalls)
 			return resp, nil
 		}
 
 		toolCalls += len(toolUses)
 		agent.appendToolResultMessages(results)
+		agent.log(traceID, "tool_loop tool_results count=%d total_tool_calls=%d", len(results), toolCalls)
+		for _, result := range results {
+			agent.log(traceID, "tool result id=%s name=%s error=%v:\n%s", result.ToolUse.ID, result.ToolUse.Name, result.IsError, result.Content)
+		}
 		for _, result := range results {
 			if result.IsError {
 				consecutiveToolErrors++
@@ -294,6 +360,7 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 				consecutiveToolErrors = 0
 			}
 			if consecutiveToolErrors >= maxConsecutiveToolErrors {
+				agent.log(traceID, "tool_loop stop=toolerrors consecutive=%d", consecutiveToolErrors)
 				return LLMResponse{StopReason: "toolerrors"}, nil
 			}
 		}
@@ -302,6 +369,9 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 
 func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...ContentBlock) <-chan StreamEvent {
 	streamRes := make(chan StreamEvent)
+	ctx, traceID := ensureTrace(ctx)
+	agent.log(traceID, "stream start prompt_chars=%d blocks=%d", len(prompt), len(blocks))
+	agent.log(traceID, "user message:\n%s", formatContentForLog(prompt, blocks))
 
 	if err := agent.appendUserMessage(prompt, blocks...); err != nil {
 		go func() {
@@ -310,10 +380,11 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 				Err:  err,
 				Done: true,
 			}
+			agent.log(traceID, "stream append_user error=%v", err)
 		}()
 		return streamRes
 	}
-	agent.autoCompactMessagesIfNeeded()
+	agent.autoCompactMessagesIfNeeded(ctx)
 
 	agent.mu.Lock()
 	if agent.llm == nil {
@@ -324,6 +395,7 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 				Err:  errors.New("agent llm is nil"),
 				Done: true,
 			}
+			agent.log(traceID, "stream error=agent llm is nil")
 		}()
 		return streamRes
 	}
@@ -356,16 +428,19 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 
 		for attempt := 0; ; attempt++ {
 			emitted := false
+			agent.log(traceID, "stream attempt=%d request model=%s messages=%d tools=%d", attempt, model, len(messagesSnapshot), len(tools))
 			stream := llm.Stream(ctx, messagesSnapshot, opts)
 			shouldRetry := false
 
 			for event := range stream {
 				if event.Err != nil {
 					if !emitted && attempt < retryConfig.MaxRetries && retryConfig.Retryable(event.Err) {
+						agent.log(traceID, "stream attempt=%d retryable_error=%v", attempt, event.Err)
 						shouldRetry = true
 						break
 					}
 					streamFailed = true
+					agent.log(traceID, "stream attempt=%d error=%v", attempt, event.Err)
 					streamRes <- event
 					break
 				}
@@ -381,6 +456,7 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 			}
 			if err := sleepWithContext(ctx, jitterDelay(delay, retryConfig.Jitter)); err != nil {
 				streamRes <- StreamEvent{Err: err, Done: true}
+				agent.log(traceID, "stream retry_sleep error=%v", err)
 				return
 			}
 			delay = time.Duration(math.Round(float64(delay) * retryConfig.Multiplier))
@@ -389,13 +465,16 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 			}
 		}
 		if streamFailed {
+			agent.log(traceID, "stream failed")
 			return
 		}
 
 		responseText := builder.String()
 		if responseText != "" {
 			agent.appendAssistantMessage(responseText)
+			agent.log(traceID, "assistant message:\n%s", responseText)
 		}
+		agent.log(traceID, "stream completed response_chars=%d", len(responseText))
 	}(messagesSnapshot)
 
 	return streamRes
@@ -547,7 +626,8 @@ func (agent *Agent) currentToolsLocked() []tool.Tool {
 	return agent.registry.Tools()
 }
 
-func (agent *Agent) autoCompactMessagesIfNeeded() {
+func (agent *Agent) autoCompactMessagesIfNeeded(ctx context.Context) {
+	traceID := TraceIDFromContext(ctx)
 	agent.mu.Lock()
 	enabled := agent.enableAutoCompact
 	threshold := agent.autoCompactThreshold
@@ -558,34 +638,50 @@ func (agent *Agent) autoCompactMessagesIfNeeded() {
 		agent.mu.Unlock()
 		return
 	}
+	beforeSize := EstimateMessagesSize(agent.messages)
 	messagesSnapshot := agent.snapshotMessagesLocked()
 	agent.mu.Unlock()
+	agent.log(traceID, "compact start messages=%d size=%d threshold=%d keep_recent=%d", len(messagesSnapshot), beforeSize, threshold, keepRecent)
 
 	compacted := CompactMessagesWithOptions(messagesSnapshot, llm, CompactOptions{
 		KeepRecentRounds: keepRecent,
 		ToolBudget:       toolBudget,
 	})
 	if len(compacted) == 0 || len(compacted) >= len(messagesSnapshot) {
+		agent.log(traceID, "compact skipped before=%d after=%d", len(messagesSnapshot), len(compacted))
 		return
 	}
 
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	if len(agent.messages) != len(messagesSnapshot) {
+		agent.log(traceID, "compact skipped reason=messages_changed")
 		return
 	}
 	agent.messages = cloneMessages(compacted)
+	agent.log(traceID, "compact completed before=%d after=%d", len(messagesSnapshot), len(compacted))
 }
 
 func (agent *Agent) ExecuteTool(ctx context.Context, toolUse map[string]any) (string, error) {
+	traceID := TraceIDFromContext(ctx)
+	agent.log(traceID, "execute_tool start")
 	prepared, err := agent.prepareToolExecution(ctx, toolUse)
 	if err != nil {
+		agent.log(traceID, "execute_tool prepare_error=%v", err)
 		return "", err
 	}
-	return agent.callPreparedTool(prepared)
+	result, err := agent.callPreparedTool(prepared)
+	if err != nil {
+		agent.log(traceID, "execute_tool name=%s error=%v", prepared.name, err)
+		return "", err
+	}
+	agent.log(traceID, "execute_tool name=%s result_chars=%d", prepared.name, len(result))
+	return result, nil
 }
 
 func (agent *Agent) ExecuteTools(ctx context.Context, toolUses []ToolUse, maxParallel int) []ToolResult {
+	traceID := TraceIDFromContext(ctx)
+	agent.log(traceID, "execute_tools start count=%d max_parallel=%d", len(toolUses), maxParallel)
 	results := make([]ToolResult, len(toolUses))
 	preparedTools := make([]preparedToolExecution, len(toolUses))
 
@@ -593,6 +689,7 @@ func (agent *Agent) ExecuteTools(ctx context.Context, toolUses []ToolUse, maxPar
 		results[i].ToolUse = toolUse
 		prepared, err := agent.prepareToolExecution(ctx, toolUse.ToMap())
 		if err != nil {
+			agent.log(traceID, "execute_tools prepare_error index=%d tool=%s error=%v", i, toolUse.Name, err)
 			results[i].Content = formatToolError(toolUse, err)
 			results[i].IsError = true
 			continue
@@ -601,6 +698,7 @@ func (agent *Agent) ExecuteTools(ctx context.Context, toolUses []ToolUse, maxPar
 	}
 
 	batches := buildToolExecutionBatches(preparedTools, results)
+	agent.log(traceID, "execute_tools batches=%d", len(batches))
 	for _, batch := range batches {
 		if batch.parallel {
 			agent.executePreparedToolBatch(ctx, toolUses, preparedTools, results, batch.start, batch.end, maxParallel)
@@ -611,10 +709,12 @@ func (agent *Agent) ExecuteTools(ctx context.Context, toolUses []ToolUse, maxPar
 		}
 		agent.executePreparedToolIntoResult(preparedTools[batch.start], &results[batch.start])
 	}
+	agent.log(traceID, "execute_tools completed count=%d", len(results))
 	return results
 }
 
 func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages []Message, opts ChatOptions, maxParallel int, maxToolCalls int, recovery StreamRecoveryConfig) (LLMResponse, []ToolResult, error) {
+	traceID := TraceIDFromContext(ctx)
 	recovery.Retry = defaultRetryConfig(recovery.Retry)
 	if recovery.MaxRetries <= 0 {
 		recovery.MaxRetries = recovery.Retry.MaxRetries
@@ -626,15 +726,18 @@ func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages 
 	var lastErr error
 	delay := recovery.Retry.InitialDelay
 	for attempt := 0; attempt <= recovery.MaxRetries; attempt++ {
+		agent.log(traceID, "streaming_tool_turn attempt=%d max_retries=%d", attempt, recovery.MaxRetries)
 		resp, results, retryable, err := agent.runStreamingToolTurnAttempt(ctx, llm, messages, opts, maxParallel, maxToolCalls)
 		resp.RetryAttempts = attempt
 		if err == nil {
 			if attempt > 0 {
 				resp.StopReason = "stream_recovered"
 			}
+			agent.log(traceID, "streaming_tool_turn attempt=%d success tools=%d results=%d", attempt, len(resp.ToolUses), len(results))
 			return resp, results, nil
 		}
 		lastErr = err
+		agent.log(traceID, "streaming_tool_turn attempt=%d error=%v retryable=%v", attempt, err, retryable)
 		if !retryable || attempt == recovery.MaxRetries || !recovery.Retry.Retryable(err) {
 			if resp.StopReason == "" {
 				resp.StopReason = "stream_interrupted"
@@ -642,6 +745,7 @@ func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages 
 			resp.RetryAttempts = attempt
 			return resp, results, err
 		}
+		agent.log(traceID, "streaming_tool_turn retry_sleep=%s", delay)
 		if err := sleepWithContext(ctx, jitterDelay(delay, recovery.Retry.Jitter)); err != nil {
 			return LLMResponse{StopReason: "stream_interrupted", RetryAttempts: attempt}, nil, err
 		}
@@ -655,11 +759,13 @@ func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages 
 }
 
 func (agent *Agent) runStreamingToolTurnAttempt(ctx context.Context, llm LLM, messages []Message, opts ChatOptions, maxParallel int, maxToolCalls int) (LLMResponse, []ToolResult, bool, error) {
+	traceID := TraceIDFromContext(ctx)
 	stream := llm.Stream(ctx, messages, opts)
 	scheduler := newStreamingToolScheduler(agent, ctx, maxParallel)
 	defer scheduler.close()
 
 	var content strings.Builder
+	var usage streamUsage
 	toolUses := make([]ToolUse, 0)
 	activeToolUses := make(map[string]*strings.Builder)
 	activeToolNames := make(map[string]string)
@@ -669,23 +775,31 @@ func (agent *Agent) runStreamingToolTurnAttempt(ctx context.Context, llm LLM, me
 		if event.Err != nil {
 			if len(toolUses) > 0 {
 				results := scheduler.finish()
+				agent.log(traceID, "streaming_tool_turn partial_recovery tools=%d results=%d error=%v", len(toolUses), len(results), event.Err)
 				return LLMResponse{
-					Content:    content.String(),
-					StopReason: "stream_recovered",
-					ToolUses:   toolUses,
+					Content:                  content.String(),
+					InputTokens:              usage.inputTokens,
+					OutputTokens:             usage.outputTokens,
+					CachedInputTokens:        usage.cachedInputTokens,
+					CacheCreationInputTokens: usage.cacheCreationInputTokens,
+					StopReason:               "stream_recovered",
+					ToolUses:                 toolUses,
 				}, results, false, nil
 			}
+			agent.log(traceID, "streaming_tool_turn stream_error before_tools error=%v", event.Err)
 			return LLMResponse{StopReason: "stream_interrupted"}, nil, true, event.Err
 		}
 		if event.Text != "" {
 			content.WriteString(event.Text)
 		}
+		usage.add(event)
 
 		switch event.Type {
 		case "tool_use":
 			if event.ToolID == "" {
 				continue
 			}
+			agent.log(traceID, "streaming_tool_turn tool_use_start id=%s name=%s", event.ToolID, event.ToolName)
 			builder := &strings.Builder{}
 			if event.ToolInput != "" {
 				builder.WriteString(event.ToolInput)
@@ -725,6 +839,7 @@ func (agent *Agent) runStreamingToolTurnAttempt(ctx context.Context, llm LLM, me
 				Input: toolInput,
 			}
 			toolUses = append(toolUses, toolUse)
+			agent.log(traceID, "streaming_tool_turn tool_use_end id=%s name=%s input_chars=%d index=%d", toolUse.ID, toolUse.Name, len(toolUse.Input), len(toolUses)-1)
 			scheduler.add(toolUse)
 			delete(activeToolUses, event.ToolID)
 			delete(activeToolNames, event.ToolID)
@@ -733,11 +848,38 @@ func (agent *Agent) runStreamingToolTurnAttempt(ctx context.Context, llm LLM, me
 	}
 
 	results := scheduler.finish()
+	agent.log(traceID, "streaming_tool_turn completed content_chars=%d tools=%d results=%d", content.Len(), len(toolUses), len(results))
 	return LLMResponse{
-		Content:    content.String(),
-		StopReason: "completed",
-		ToolUses:   toolUses,
+		Content:                  content.String(),
+		InputTokens:              usage.inputTokens,
+		OutputTokens:             usage.outputTokens,
+		CachedInputTokens:        usage.cachedInputTokens,
+		CacheCreationInputTokens: usage.cacheCreationInputTokens,
+		StopReason:               "completed",
+		ToolUses:                 toolUses,
 	}, results, false, nil
+}
+
+type streamUsage struct {
+	inputTokens              int
+	outputTokens             int
+	cachedInputTokens        int
+	cacheCreationInputTokens int
+}
+
+func (usage *streamUsage) add(event StreamEvent) {
+	if event.InputTokens > 0 {
+		usage.inputTokens = event.InputTokens
+	}
+	if event.OutputTokens > 0 {
+		usage.outputTokens = event.OutputTokens
+	}
+	if event.CachedInputTokens > 0 {
+		usage.cachedInputTokens = event.CachedInputTokens
+	}
+	if event.CacheCreationInputTokens > 0 {
+		usage.cacheCreationInputTokens = event.CacheCreationInputTokens
+	}
 }
 
 type streamingToolScheduler struct {
@@ -770,18 +912,22 @@ func newStreamingToolScheduler(agent *Agent, ctx context.Context, maxParallel in
 }
 
 func (scheduler *streamingToolScheduler) add(toolUse ToolUse) {
+	traceID := TraceIDFromContext(scheduler.ctx)
 	index := len(scheduler.results)
 	scheduler.results = append(scheduler.results, ToolResult{ToolUse: toolUse})
+	scheduler.agent.log(traceID, "streaming_scheduler add index=%d tool=%s", index, toolUse.Name)
 
 	prepared, err := scheduler.agent.prepareToolExecution(scheduler.ctx, toolUse.ToMap())
 	if err != nil {
 		scheduler.flushSafeBatch()
+		scheduler.agent.log(traceID, "streaming_scheduler prepare_error index=%d tool=%s error=%v", index, toolUse.Name, err)
 		scheduler.results[index].Content = formatToolError(toolUse, err)
 		scheduler.results[index].IsError = true
 		return
 	}
 
 	if prepared.parallelSafe {
+		scheduler.agent.log(traceID, "streaming_scheduler start_parallel index=%d tool=%s", index, toolUse.Name)
 		item := streamingPreparedTool{
 			index:    index,
 			toolUse:  toolUse,
@@ -794,6 +940,7 @@ func (scheduler *streamingToolScheduler) add(toolUse ToolUse) {
 	}
 
 	scheduler.flushSafeBatch()
+	scheduler.agent.log(traceID, "streaming_scheduler execute_serial index=%d tool=%s", index, toolUse.Name)
 	scheduler.agent.executePreparedToolIntoResult(prepared, &scheduler.results[index])
 }
 
@@ -827,8 +974,10 @@ func (scheduler *streamingToolScheduler) flushSafeBatch() {
 	if len(scheduler.safeBatch) == 0 {
 		return
 	}
+	traceID := TraceIDFromContext(scheduler.ctx)
 	batch := scheduler.safeBatch
 	scheduler.safeBatch = nil
+	scheduler.agent.log(traceID, "streaming_scheduler flush_parallel count=%d", len(batch))
 
 	if scheduler.maxParallel <= 1 || len(batch) == 1 {
 		for _, item := range batch {
@@ -866,6 +1015,7 @@ func buildToolExecutionBatches(preparedTools []preparedToolExecution, results []
 }
 
 func (agent *Agent) executePreparedToolBatch(ctx context.Context, toolUses []ToolUse, preparedTools []preparedToolExecution, results []ToolResult, start int, end int, maxParallel int) {
+	traceID := TraceIDFromContext(ctx)
 	count := end - start
 	if count <= 0 {
 		return
@@ -877,6 +1027,7 @@ func (agent *Agent) executePreparedToolBatch(ctx context.Context, toolUses []Too
 		maxParallel = count
 	}
 	if maxParallel <= 1 {
+		agent.log(traceID, "tool_batch serial start=%d end=%d", start, end)
 		for i := start; i < end; i++ {
 			agent.executePreparedToolIntoResult(preparedTools[i], &results[i])
 		}
@@ -885,6 +1036,7 @@ func (agent *Agent) executePreparedToolBatch(ctx context.Context, toolUses []Too
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, maxParallel)
+	agent.log(traceID, "tool_batch parallel start=%d end=%d max_parallel=%d", start, end, maxParallel)
 	for i := start; i < end; i++ {
 		wg.Add(1)
 		go func(index int) {
@@ -911,9 +1063,11 @@ type preparedToolExecution struct {
 	registry         *tool.Registry
 	enableToolBudget bool
 	toolBudget       ToolBudget
+	traceID          string
 }
 
 func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string]any) (preparedToolExecution, error) {
+	traceID := TraceIDFromContext(ctx)
 	if toolUse == nil {
 		return preparedToolExecution{}, errors.New("tool use is nil")
 	}
@@ -925,6 +1079,7 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 
 	input, err := toolInputFromMap(toolUse)
 	if err != nil {
+		agent.log(traceID, "tool_prepare name=%s input_error=%v", name, err)
 		return preparedToolExecution{}, err
 	}
 
@@ -938,20 +1093,24 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 	agent.mu.Unlock()
 
 	if registry == nil {
+		agent.log(traceID, "tool_prepare name=%s error=registry_nil", name)
 		return preparedToolExecution{}, errors.New("tool registry is nil")
 	}
 
 	permissionCheck := PermissionCheck{ParallelSafe: true}
 	if permission != nil {
+		agent.log(traceID, "tool_permission check name=%s id=%s", name, toolUseID)
 		check, err := permission.CheckWithResult(ctx, PermissionRequest{
 			ToolUseID: toolUseID,
 			ToolName:  name,
 			ToolInput: input,
 		})
 		if err != nil {
+			agent.log(traceID, "tool_permission denied name=%s id=%s error=%v", name, toolUseID, err)
 			return preparedToolExecution{}, err
 		}
 		permissionCheck = check
+		agent.log(traceID, "tool_permission allowed name=%s id=%s parallel_safe=%v", name, toolUseID, permissionCheck.ParallelSafe)
 	}
 
 	return preparedToolExecution{
@@ -966,18 +1125,22 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 		registry:         registry,
 		enableToolBudget: enableToolBudget,
 		toolBudget:       toolBudget,
+		traceID:          traceID,
 	}, nil
 }
 
 func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution, result *ToolResult) {
+	traceID := prepared.traceID
 	content, err := agent.callPreparedTool(prepared)
 	if err != nil {
+		agent.log(traceID, "tool_execute error name=%s id=%s error=%v", prepared.name, prepared.toolUse.ID, err)
 		result.Content = formatToolError(result.ToolUse, err)
 		result.IsError = true
 		return
 	}
 	result.Content = content
 	result.IsError = false
+	agent.log(traceID, "tool_execute success name=%s id=%s result_chars=%d", prepared.name, prepared.toolUse.ID, len(content))
 }
 
 func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, error) {

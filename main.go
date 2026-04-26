@@ -3,15 +3,23 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/GongShichen/CodingMan/agent"
+	"golang.org/x/term"
 )
 
 const (
@@ -40,6 +48,7 @@ type RuntimeConfig struct {
 	ToolBudget       agent.ToolBudget
 	Retry            agent.RetryConfig
 	PromptCache      agent.PromptCacheConfig
+	LogPath          string
 }
 
 func main() {
@@ -61,6 +70,11 @@ func main() {
 	if err != nil {
 		fatal("create llm", err)
 	}
+	logger, err := agent.NewFileLogger(cfg.LogPath)
+	if err != nil {
+		fatal("create logger", err)
+	}
+	defer logger.Close()
 
 	a := agent.NewAgent(agent.AgentConfig{
 		LLM:                      client,
@@ -75,6 +89,7 @@ func main() {
 		ToolBudget:               cfg.ToolBudget,
 		RetryConfig:              cfg.Retry,
 		PromptCache:              cfg.PromptCache,
+		Logger:                   logger,
 	})
 
 	RunTUI(a, cfg, source)
@@ -83,8 +98,9 @@ func main() {
 func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
+	tui := newTUIController(scanner)
 	if permissions := a.Permission(); permissions != nil {
-		permissions.SetAskFunc(tuiPermissionPrompt(scanner))
+		permissions.SetAskFunc(tui.permissionPrompt)
 	}
 
 	printHeader(cfg, source)
@@ -125,15 +141,38 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 		}
 
 		start := time.Now()
-		fmt.Printf("%srunning agent loop...%s\n", colorGray, colorReset)
-		resp, err := a.RunToolLoop(context.Background(), prompt)
+		fmt.Printf("%srunning agent loop... press Esc to interrupt%s\n", colorGray, colorReset)
+		resp, interrupted, err := tui.runAgent(a, prompt)
 		if err != nil {
 			fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
-			continue
+			if !interrupted {
+				continue
+			}
 		}
 
 		if resp.Content != "" {
 			fmt.Printf("\n%s%s%s\n", colorBold, strings.TrimSpace(resp.Content), colorReset)
+		}
+		if interrupted {
+			fmt.Println(colorDim + "interrupted. Add more context, or leave empty to skip." + colorReset)
+			fmt.Printf("%s+%s ", colorCyan, colorReset)
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					fmt.Fprintf(os.Stderr, "%sread input: %v%s\n", colorRed, err, colorReset)
+				}
+				return
+			}
+			followUp := strings.TrimSpace(scanner.Text())
+			if followUp != "" {
+				resp, interrupted, err = tui.runAgent(a, followUp)
+				if err != nil {
+					fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+					continue
+				}
+				if resp.Content != "" {
+					fmt.Printf("\n%s%s%s\n", colorBold, strings.TrimSpace(resp.Content), colorReset)
+				}
+			}
 		}
 		if resp.StopReason != "" && resp.StopReason != "completed" {
 			fmt.Printf("%sstop: %s%s\n", colorGray, resp.StopReason, colorReset)
@@ -290,63 +329,319 @@ func printPermissionStatus(permissions *agent.PermissionManager) {
 	fmt.Printf("%sdenied tools:%s %s\n", colorGray, colorReset, strings.Join(snapshot.DeniedTools, ", "))
 }
 
-func tuiPermissionPrompt(scanner *bufio.Scanner) agent.PermissionAskFunc {
-	return func(ctx context.Context, request agent.PermissionRequest) (agent.PermissionDecision, string, error) {
-		fmt.Printf("\n%sTool permission request%s\n", colorBold, colorReset)
-		fmt.Printf("%stool:%s %s\n", colorGray, colorReset, request.ToolName)
-		if request.ToolUseID != "" {
-			fmt.Printf("%sid:%s %s\n", colorGray, colorReset, request.ToolUseID)
-		}
-		fmt.Printf("%sinput:%s\n%s\n", colorGray, colorReset, request.InputJSON())
-		fmt.Println(colorDim + "Choose:" + colorReset)
-		fmt.Println("  1. Yes, allow once")
-		fmt.Println("  2. No, deny once")
-		if request.ToolName == "bash" {
-			fmt.Println("  3. Always allow this command")
-		} else {
-			fmt.Println("  3. Always allow this tool")
-		}
-		fmt.Println("  4. Always deny this tool")
-		fmt.Print(colorDim + "Select option [1-4] > " + colorReset)
+type tuiController struct {
+	scanner      *bufio.Scanner
+	selectionReq chan selectionRequest
+}
 
-		type answer struct {
-			text string
-			ok   bool
-			err  error
-		}
-		result := make(chan answer, 1)
-		go func() {
-			if !scanner.Scan() {
-				result <- answer{ok: false, err: scanner.Err()}
-				return
-			}
-			result <- answer{text: strings.TrimSpace(scanner.Text()), ok: true}
-		}()
+type selectionRequest struct {
+	response chan string
+}
 
+type agentRunResult struct {
+	resp        agent.LLMResponse
+	err         error
+	interrupted bool
+}
+
+func newTUIController(scanner *bufio.Scanner) *tuiController {
+	return &tuiController{
+		scanner:      scanner,
+		selectionReq: make(chan selectionRequest),
+	}
+}
+
+func (tui *tuiController) runAgent(a *agent.Agent, prompt string) (agent.LLMResponse, bool, error) {
+	promptText, blocks, err := buildPromptContent(prompt)
+	if err != nil {
+		return agent.LLMResponse{}, false, err
+	}
+	printAttachedImages(blocks)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan agentRunResult, 1)
+	go func() {
+		resp, err := a.RunToolLoop(ctx, promptText, blocks...)
+		done <- agentRunResult{resp: resp, err: err}
+	}()
+
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		result := <-done
+		return result.resp, false, result.err
+	}
+
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		result := <-done
+		return result.resp, false, result.err
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	if err := syscall.SetNonblock(int(os.Stdin.Fd()), true); err != nil {
+		result := <-done
+		return result.resp, false, result.err
+	}
+	defer syscall.SetNonblock(int(os.Stdin.Fd()), false)
+
+	var pending *selectionRequest
+	var interrupted bool
+	buf := make([]byte, 1)
+	for {
 		select {
-		case <-ctx.Done():
-			return agent.PermissionDecisionDeny, "", ctx.Err()
-		case res := <-result:
-			if res.err != nil {
-				return agent.PermissionDecisionDeny, "", res.err
+		case result := <-done:
+			result.interrupted = interrupted
+			return result.resp, result.interrupted, result.err
+		case req := <-tui.selectionReq:
+			pending = &req
+		default:
+		}
+
+		n, readErr := os.Stdin.Read(buf)
+		if n > 0 {
+			key := buf[0]
+			if pending != nil && key >= '1' && key <= '4' {
+				pending.response <- string(key)
+				pending = nil
+				continue
 			}
-			if !res.ok {
-				return agent.PermissionDecisionDeny, "input closed", nil
+			if key == 27 {
+				interrupted = true
+				cancel()
 			}
-			switch res.text {
-			case "1":
-				return agent.PermissionDecisionAllow, "", nil
-			case "2":
-				return agent.PermissionDecisionDeny, "denied by user", nil
-			case "3":
-				return agent.PermissionDecisionAllowRule, request.AllowRuleValue(), nil
-			case "4":
-				return agent.PermissionDecisionDenyTool, "denied by user", nil
-			default:
-				return agent.PermissionDecisionDeny, "invalid permission response", nil
+		}
+		if readErr != nil && !errors.Is(readErr, syscall.EAGAIN) && !errors.Is(readErr, syscall.EWOULDBLOCK) && !errors.Is(readErr, io.EOF) {
+			cancel()
+			result := <-done
+			return result.resp, interrupted, readErr
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (tui *tuiController) permissionPrompt(ctx context.Context, request agent.PermissionRequest) (agent.PermissionDecision, string, error) {
+	fmt.Printf("\n%sTool permission request%s\n", colorBold, colorReset)
+	fmt.Printf("%stool:%s %s\n", colorGray, colorReset, request.ToolName)
+	if request.ToolUseID != "" {
+		fmt.Printf("%sid:%s %s\n", colorGray, colorReset, request.ToolUseID)
+	}
+	fmt.Printf("%sinput:%s\n%s\n", colorGray, colorReset, request.InputJSON())
+	fmt.Println(colorDim + "Choose:" + colorReset)
+	fmt.Println("  1. Yes, allow once")
+	fmt.Println("  2. No, deny once")
+	if request.ToolName == "bash" {
+		fmt.Println("  3. Always allow this command")
+	} else {
+		fmt.Println("  3. Always allow this tool")
+	}
+	fmt.Println("  4. Always deny this tool")
+	fmt.Print(colorDim + "Select option [1-4] > " + colorReset)
+
+	selection, err := tui.readSelection(ctx)
+	if err != nil {
+		return agent.PermissionDecisionDeny, "", err
+	}
+	switch selection {
+	case "1":
+		return agent.PermissionDecisionAllow, "", nil
+	case "2":
+		return agent.PermissionDecisionDeny, "denied by user", nil
+	case "3":
+		return agent.PermissionDecisionAllowRule, request.AllowRuleValue(), nil
+	case "4":
+		return agent.PermissionDecisionDenyTool, "denied by user", nil
+	default:
+		return agent.PermissionDecisionDeny, "invalid permission response", nil
+	}
+}
+
+func (tui *tuiController) readSelection(ctx context.Context) (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		if !tui.scanner.Scan() {
+			if err := tui.scanner.Err(); err != nil {
+				return "", err
+			}
+			return "", errors.New("input closed")
+		}
+		return strings.TrimSpace(tui.scanner.Text()), nil
+	}
+
+	req := selectionRequest{response: make(chan string, 1)}
+	select {
+	case tui.selectionReq <- req:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	select {
+	case value := <-req.response:
+		fmt.Println(value)
+		return value, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+var markdownImagePattern = regexp.MustCompile(`!\[[^\]]*]\(([^)]+)\)`)
+
+func buildPromptContent(input string) (string, []agent.ContentBlock, error) {
+	text := input
+	refs := make([]string, 0)
+
+	for _, match := range markdownImagePattern.FindAllStringSubmatch(input, -1) {
+		if len(match) >= 2 {
+			refs = append(refs, strings.TrimSpace(match[1]))
+			text = strings.Replace(text, match[0], "", 1)
+		}
+	}
+
+	for _, field := range strings.Fields(text) {
+		ref := cleanImageRef(field)
+		if ref == "" {
+			continue
+		}
+		if strings.HasPrefix(ref, "@") {
+			refs = append(refs, strings.TrimPrefix(ref, "@"))
+			text = strings.Replace(text, field, "", 1)
+			continue
+		}
+		if looksLikeImageRef(ref) {
+			refs = append(refs, ref)
+			text = strings.Replace(text, field, "", 1)
+		}
+	}
+
+	blocks := make([]agent.ContentBlock, 0, len(refs))
+	seen := map[string]struct{}{}
+	for _, ref := range refs {
+		ref = cleanImageRef(ref)
+		if ref == "" {
+			continue
+		}
+		if _, exists := seen[ref]; exists {
+			continue
+		}
+		seen[ref] = struct{}{}
+		block, err := imageBlockFromRef(ref)
+		if err != nil {
+			return "", nil, err
+		}
+		blocks = append(blocks, block)
+	}
+
+	return strings.TrimSpace(text), blocks, nil
+}
+
+func printAttachedImages(blocks []agent.ContentBlock) {
+	count := 0
+	for _, block := range blocks {
+		if block.Type == agent.ContentTypeImage {
+			count++
+		}
+	}
+	if count > 0 {
+		fmt.Printf("%sattached images:%s %d\n", colorGray, colorReset, count)
+	}
+}
+
+func cleanImageRef(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, `"'`)
+	value = strings.TrimRight(value, ".,;")
+	if strings.HasPrefix(value, "file://") {
+		parsed, err := url.Parse(value)
+		if err == nil {
+			if path, err := url.PathUnescape(parsed.Path); err == nil {
+				value = path
 			}
 		}
 	}
+	return value
+}
+
+func looksLikeImageRef(value string) bool {
+	if strings.HasPrefix(value, "@") {
+		return true
+	}
+	if strings.HasPrefix(value, "data:image/") {
+		return true
+	}
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		parsed, err := url.Parse(value)
+		if err != nil {
+			return false
+		}
+		return supportedImageExt(strings.ToLower(filepath.Ext(parsed.Path)))
+	}
+	ext := strings.ToLower(filepath.Ext(value))
+	return supportedImageExt(ext)
+}
+
+func imageBlockFromRef(ref string) (agent.ContentBlock, error) {
+	if strings.HasPrefix(ref, "data:image/") {
+		mediaType, data, ok := strings.Cut(strings.TrimPrefix(ref, "data:"), ";base64,")
+		if !ok || mediaType == "" || data == "" {
+			return agent.ContentBlock{}, fmt.Errorf("invalid image data URL")
+		}
+		return agent.ImageBase64Block(mediaType, data), nil
+	}
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		return agent.ImageURLBlock(ref), nil
+	}
+
+	path := expandHome(ref)
+	if !filepath.IsAbs(path) {
+		abs, err := filepath.Abs(path)
+		if err == nil {
+			path = abs
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return agent.ContentBlock{}, fmt.Errorf("image not found: %s", ref)
+	}
+	if info.IsDir() {
+		return agent.ContentBlock{}, fmt.Errorf("image path is a directory: %s", ref)
+	}
+	if !supportedImageExt(strings.ToLower(filepath.Ext(path))) {
+		return agent.ContentBlock{}, fmt.Errorf("unsupported image type: %s", ref)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return agent.ContentBlock{}, err
+	}
+	mediaType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+	if mediaType == "" {
+		mediaType = http.DetectContentType(data)
+	}
+	if !strings.HasPrefix(mediaType, "image/") {
+		return agent.ContentBlock{}, fmt.Errorf("unsupported image media type %q: %s", mediaType, ref)
+	}
+	return agent.ImageBase64Block(mediaType, base64.StdEncoding.EncodeToString(data)), nil
+}
+
+func supportedImageExt(ext string) bool {
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func expandHome(path string) string {
+	if path == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+	}
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+	}
+	return path
 }
 
 func loadRuntimeConfig(projectRoot string) (RuntimeConfig, string, error) {
@@ -409,6 +704,7 @@ func loadRuntimeConfig(projectRoot string) (RuntimeConfig, string, error) {
 		Retention: valueOrDefault(values["PROMPT_CACHE_RETENTION"], agent.PromptCacheRetentionInMemory),
 		TTL:       valueOrDefault(values["PROMPT_CACHE_TTL"], agent.PromptCacheTTL5m),
 	}
+	cfg.LogPath = valueOrDefault(values["LOG_PATH"], filepath.Join(projectRoot, ".codingman.log"))
 
 	if err := validateRuntimeConfig(cfg); err != nil {
 		return RuntimeConfig{}, "", err

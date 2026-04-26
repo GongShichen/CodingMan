@@ -4,7 +4,10 @@ go 1.26.0
 
 require github.com/GongShichen/CodingMan/agent v0.0.0
 
-require github.com/GongShichen/CodingMan/tool v0.0.0 // indirect
+require (
+	github.com/GongShichen/CodingMan/tool v0.0.0 // indirect
+	golang.org/x/sys v0.34.0 // indirect
+)
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.37.0 // indirect
@@ -14,6 +17,7 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/term v0.33.0
 )
 
 replace github.com/GongShichen/CodingMan/agent => ./agent
