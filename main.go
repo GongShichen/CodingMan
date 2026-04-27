@@ -44,10 +44,13 @@ type RuntimeConfig struct {
 	MaxParallelTools int
 	MaxToolErrors    int
 	MaxAPIErrors     int
+	MaxSubAgentDepth int
+	MaxSubAgents     int
 	EnableToolBudget bool
 	ToolBudget       agent.ToolBudget
 	Retry            agent.RetryConfig
 	PromptCache      agent.PromptCacheConfig
+	Coordination     agent.CoordinationConfig
 	LogPath          string
 }
 
@@ -89,10 +92,13 @@ func main() {
 		MaxParallelToolCalls:     cfg.MaxParallelTools,
 		MaxConsecutiveToolErrors: cfg.MaxToolErrors,
 		MaxConsecutiveAPIErrors:  cfg.MaxAPIErrors,
+		MaxConcurrentSubAgents:   cfg.MaxSubAgents,
+		MaxSubAgentDepth:         cfg.MaxSubAgentDepth,
 		EnableToolBudget:         cfg.EnableToolBudget,
 		ToolBudget:               cfg.ToolBudget,
 		RetryConfig:              cfg.Retry,
 		PromptCache:              cfg.PromptCache,
+		Coordination:             cfg.Coordination,
 		Logger:                   logger,
 	})
 
@@ -136,7 +142,7 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 			continue
 		}
 		if strings.HasPrefix(prompt, "/") {
-			if handled := handleSlashCommand(a, prompt); handled {
+			if handled := handleSlashCommand(a, tui, prompt); handled {
 				continue
 			}
 			fmt.Printf("%sunknown command:%s %s\n", colorRed, colorReset, prompt)
@@ -145,6 +151,21 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 		}
 
 		start := time.Now()
+		if tui.planMode {
+			resp, execute, err := tui.runPlan(a, prompt)
+			if err != nil {
+				fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+				continue
+			}
+			if resp.Content != "" {
+				fmt.Printf("\n%s%s%s\n", colorBold, strings.TrimSpace(resp.Content), colorReset)
+			}
+			if !execute {
+				fmt.Printf("%splan skipped elapsed=%s%s\n\n", colorGray, time.Since(start).Round(time.Millisecond), colorReset)
+				continue
+			}
+			fmt.Println(colorDim + "executing approved plan" + colorReset)
+		}
 		fmt.Printf("%srunning agent loop... press Esc to interrupt%s\n", colorGray, colorReset)
 		resp, interrupted, err := tui.runAgent(a, prompt)
 		if err != nil {
@@ -211,6 +232,9 @@ func printHelp() {
 	fmt.Println("  /cache                        show prompt cache status")
 	fmt.Println("  /cache on                     enable prompt cache")
 	fmt.Println("  /cache off                    disable prompt cache")
+	fmt.Println("  /plan                         show plan mode status")
+	fmt.Println("  /plan on                      plan before execution")
+	fmt.Println("  /plan off                     execute directly")
 	fmt.Println("  /system <path>                load system prompt from file")
 	fmt.Println("  /permission                   show permission mode and policy")
 	fmt.Println("  /permission ask               ask before tool calls")
@@ -224,13 +248,15 @@ func printHelp() {
 	fmt.Println()
 }
 
-func handleSlashCommand(a *agent.Agent, prompt string) bool {
+func handleSlashCommand(a *agent.Agent, tui *tuiController, prompt string) bool {
 	fields := strings.Fields(prompt)
 	if len(fields) == 0 {
 		return false
 	}
 
 	switch fields[0] {
+	case "/plan":
+		return handlePlanCommand(tui, fields)
 	case "/system":
 		return handleSystemCommand(a, fields)
 	case "/permission":
@@ -289,6 +315,36 @@ func handleSlashCommand(a *agent.Agent, prompt string) bool {
 	default:
 		return false
 	}
+}
+
+func handlePlanCommand(tui *tuiController, fields []string) bool {
+	if tui == nil {
+		fmt.Println(colorRed + "plan mode is unavailable" + colorReset)
+		return true
+	}
+	if len(fields) == 1 {
+		printPlanStatus(tui.planMode)
+		return true
+	}
+	switch strings.ToLower(fields[1]) {
+	case "on", "enable", "enabled":
+		tui.planMode = true
+	case "off", "disable", "disabled":
+		tui.planMode = false
+	default:
+		fmt.Println(colorRed + "usage: /plan [on|off]" + colorReset)
+		return true
+	}
+	printPlanStatus(tui.planMode)
+	return true
+}
+
+func printPlanStatus(enabled bool) {
+	state := "off"
+	if enabled {
+		state = "on"
+	}
+	fmt.Printf("%splan mode:%s %s\n", colorGray, colorReset, state)
 }
 
 func handleSystemCommand(a *agent.Agent, fields []string) bool {
@@ -377,6 +433,7 @@ func printPermissionStatus(permissions *agent.PermissionManager) {
 type tuiController struct {
 	scanner      *bufio.Scanner
 	selectionReq chan selectionRequest
+	planMode     bool
 }
 
 type selectionRequest struct {
@@ -394,6 +451,28 @@ func newTUIController(scanner *bufio.Scanner) *tuiController {
 		scanner:      scanner,
 		selectionReq: make(chan selectionRequest),
 	}
+}
+
+func (tui *tuiController) runPlan(a *agent.Agent, prompt string) (agent.LLMResponse, bool, error) {
+	promptText, blocks, err := buildPromptContent(prompt)
+	if err != nil {
+		return agent.LLMResponse{}, false, err
+	}
+	printAttachedImages(blocks)
+	fmt.Printf("%splanning...%s\n", colorGray, colorReset)
+	resp, err := a.Plan(context.Background(), promptText, blocks...)
+	if err != nil {
+		return resp, false, err
+	}
+	fmt.Println(colorDim + "Choose:" + colorReset)
+	fmt.Println("  1. Execute this plan")
+	fmt.Println("  2. Skip")
+	fmt.Print(colorDim + "Select option [1-2] > " + colorReset)
+	selection, err := tui.readSelection(context.Background())
+	if err != nil {
+		return resp, false, err
+	}
+	return resp, selection == "1", nil
 }
 
 func (tui *tuiController) runAgent(a *agent.Agent, prompt string) (agent.LLMResponse, bool, error) {
@@ -728,6 +807,13 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 	cfg.MaxParallelTools = intValue(values, "MAX_PARALLEL_TOOL_CALLS", 4)
 	cfg.MaxToolErrors = intValue(values, "MAX_CONSECUTIVE_TOOL_ERRORS", 3)
 	cfg.MaxAPIErrors = intValue(values, "MAX_CONSECUTIVE_API_ERRORS", 3)
+	cfg.MaxSubAgentDepth = intValue(values, "MAX_SUB_AGENT_DEPTH", 1)
+	cfg.MaxSubAgents = intValue(values, "MAX_CONCURRENT_SUB_AGENTS", 4)
+	cfg.Coordination = agent.CoordinationConfig{
+		SharedTempDir:     values["WORKER_SHARED_TEMP_DIR"],
+		EnableGitWorktree: boolValue(values, "WORKER_GIT_WORKTREE", false),
+		WorktreeBaseDir:   values["WORKER_WORKTREE_BASE_DIR"],
+	}
 
 	cfg.EnableToolBudget = boolValue(values, "ENABLE_TOOL_BUDGET", true)
 	cfg.ToolBudget = agent.ToolBudget{

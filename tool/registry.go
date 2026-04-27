@@ -29,6 +29,23 @@ func NewRegistry() *Registry {
 	}
 }
 
+func (r *Registry) Clone() *Registry {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	clone := NewRegistry()
+	for name, tool := range r.tools {
+		clone.tools[name] = tool
+	}
+	for name, factory := range r.factories {
+		clone.factories[name] = factory
+	}
+	return clone
+}
+
 func (r *Registry) Register(tool Tool) error {
 	if tool == nil {
 		return ErrNilTool

@@ -49,6 +49,9 @@ func (llm *fakeLLM) Stream(ctx context.Context, messages []agent.Message, opts a
 
 func TestDefaultAndCustomSystemPrompt(t *testing.T) {
 	a := agent.NewAgent(agent.AgentConfig{LLM: &fakeLLM{}})
+	if a.ID() != "main" {
+		t.Fatalf("default agent id = %q, want main", a.ID())
+	}
 	if !strings.Contains(a.SystemPrompt(), "You are CodingMan") {
 		t.Fatalf("default coding system prompt missing:\n%s", a.SystemPrompt())
 	}
@@ -62,6 +65,311 @@ func TestDefaultAndCustomSystemPrompt(t *testing.T) {
 	}
 	if !strings.Contains(system, "工作目录:") {
 		t.Fatalf("context metadata missing after custom system prompt:\n%s", system)
+	}
+}
+
+func TestPlanDoesNotMutateConversationOrExposeTools(t *testing.T) {
+	llm := &fakeLLM{
+		chatFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {
+			if len(opts.Tools) != 0 {
+				t.Fatalf("plan mode should not expose tools: %+v", opts.Tools)
+			}
+			formatted := agent.FormatMessages(messages)
+			if !strings.Contains(formatted, "Plan mode:") || !strings.Contains(formatted, "change request") {
+				t.Fatalf("plan prompt missing:\n%s", formatted)
+			}
+			return agent.LLMResponse{Content: "plan only", StopReason: "completed"}, nil
+		},
+	}
+	a := agent.NewAgent(agent.AgentConfig{LLM: llm})
+	resp, err := a.Plan(context.Background(), "change request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != "plan only" {
+		t.Fatalf("unexpected plan response: %+v", resp)
+	}
+	if got := len(a.Messages()); got != 0 {
+		t.Fatalf("plan mode should not mutate conversation, messages=%d", got)
+	}
+}
+
+func TestDelegateToolRunsSubAgentAndRecordsA2A(t *testing.T) {
+	llm := &fakeLLM{}
+	llm.streamFn = func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+		switch call {
+		case 0:
+			return []agent.StreamEvent{
+				{Type: "tool_use", ToolID: "subagent_1", ToolCallID: "subagent_1", ToolName: "subagent"},
+				{Type: "tool_use_end", ToolID: "subagent_1", ToolCallID: "subagent_1", ToolName: "subagent", ToolInput: `{"task":"inspect delegated work","agent_name":"worker"}`},
+				{Done: true},
+			}
+		case 1:
+			for _, tool := range opts.Tools {
+				if tool.Name() == "subagent" {
+					t.Fatal("sub-agent must not expose subagent tool")
+				}
+			}
+			return []agent.StreamEvent{
+				{Type: "text", Text: "child completed"},
+				{Done: true},
+			}
+		default:
+			formatted := agent.FormatMessages(messages)
+			if !strings.Contains(formatted, "child completed") {
+				t.Fatalf("parent did not receive sub-agent result:\n%s", formatted)
+			}
+			return []agent.StreamEvent{
+				{Type: "text", Text: "parent integrated"},
+				{Done: true},
+			}
+		}
+	}
+
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Permission: agent.PermissionConfig{
+			Mode: agent.PermissionModeFullAuto,
+		},
+	})
+	resp, err := a.RunToolLoop(context.Background(), "start subagent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != "parent integrated" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	messages := a.A2AMessages()
+	if len(messages) != 2 {
+		t.Fatalf("expected task request and result messages, got %+v", messages)
+	}
+	if messages[0].Type != agent.A2AMessageTaskRequest || messages[1].Type != agent.A2AMessageTaskResult {
+		t.Fatalf("unexpected A2A messages: %+v", messages)
+	}
+	if messages[0].From != "main" || messages[0].To != "main.1" || messages[1].From != "main.1" || messages[1].To != "main" {
+		t.Fatalf("unexpected A2A agent ids: %+v", messages)
+	}
+}
+
+func TestDelegateToolRunsMultipleSubAgentsConcurrently(t *testing.T) {
+	llm := &fakeLLM{}
+	llm.streamFn = func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+		switch call {
+		case 0:
+			return []agent.StreamEvent{
+				{Type: "tool_use", ToolID: "subagent_multi", ToolCallID: "subagent_multi", ToolName: "subagent"},
+				{Type: "tool_use_end", ToolID: "subagent_multi", ToolCallID: "subagent_multi", ToolName: "subagent", ToolInput: `{"tasks":[{"task":"first","agent_name":"alpha"},{"task":"second","agent_name":"beta"}]}`},
+				{Done: true},
+			}
+		case 1:
+			return []agent.StreamEvent{{Type: "text", Text: "child one"}, {Done: true}}
+		case 2:
+			return []agent.StreamEvent{{Type: "text", Text: "child two"}, {Done: true}}
+		default:
+			formatted := agent.FormatMessages(messages)
+			if !strings.Contains(formatted, `"agent_id": "main.1"`) || !strings.Contains(formatted, `"agent_id": "main.2"`) {
+				t.Fatalf("batched sub-agent ids missing:\n%s", formatted)
+			}
+			if !strings.Contains(formatted, "child one") || !strings.Contains(formatted, "child two") {
+				t.Fatalf("batched sub-agent results missing:\n%s", formatted)
+			}
+			return []agent.StreamEvent{{Type: "text", Text: "parent merged"}, {Done: true}}
+		}
+	}
+
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Permission: agent.PermissionConfig{
+			Mode: agent.PermissionModeFullAuto,
+		},
+		MaxConcurrentSubAgents: 2,
+	})
+	resp, err := a.RunToolLoop(context.Background(), "start multiple subagents")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != "parent merged" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	messages := a.A2AMessages()
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 A2A messages, got %+v", messages)
+	}
+	seen := map[string]bool{}
+	for _, message := range messages {
+		if strings.HasPrefix(message.From, "main.") {
+			seen[message.From] = true
+		}
+		if strings.HasPrefix(message.To, "main.") {
+			seen[message.To] = true
+		}
+	}
+	if !seen["main.1"] || !seen["main.2"] {
+		t.Fatalf("expected distinct child agent ids, got messages: %+v", messages)
+	}
+}
+
+func TestSubAgentDoesNotInheritParentConversationContext(t *testing.T) {
+	const parentOnly = "parent-only-context-marker"
+	const childTask = "child isolated task"
+
+	llm := &fakeLLM{}
+	llm.streamFn = func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+		switch call {
+		case 0:
+			formatted := agent.FormatMessages(messages)
+			if !strings.Contains(formatted, parentOnly) {
+				t.Fatalf("parent request missing parent context marker:\n%s", formatted)
+			}
+			return []agent.StreamEvent{
+				{Type: "tool_use", ToolID: "subagent_isolated", ToolCallID: "subagent_isolated", ToolName: "subagent"},
+				{Type: "tool_use_end", ToolID: "subagent_isolated", ToolCallID: "subagent_isolated", ToolName: "subagent", ToolInput: `{"task":"` + childTask + `"}`},
+				{Done: true},
+			}
+		case 1:
+			formatted := agent.FormatMessages(messages)
+			if strings.Contains(formatted, parentOnly) {
+				t.Fatalf("sub-agent inherited parent conversation context:\n%s", formatted)
+			}
+			if !strings.Contains(formatted, childTask) {
+				t.Fatalf("sub-agent did not receive delegated task:\n%s", formatted)
+			}
+			return []agent.StreamEvent{{Type: "text", Text: "child isolated"}, {Done: true}}
+		default:
+			return []agent.StreamEvent{{Type: "text", Text: "parent done"}, {Done: true}}
+		}
+	}
+
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Permission: agent.PermissionConfig{
+			Mode: agent.PermissionModeFullAuto,
+		},
+	})
+	resp, err := a.RunToolLoop(context.Background(), "parent asks with "+parentOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != "parent done" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+func TestA2ARejectsNonDirectParentChildCommunication(t *testing.T) {
+	bus := agent.NewA2ABus()
+	bus.RegisterAgent("main", "")
+	bus.RegisterAgent("main.1", "main")
+	bus.RegisterAgent("main.2", "main")
+
+	if err := bus.Send(agent.A2AMessage{From: "main", To: "main.1", Type: agent.A2AMessageTaskRequest, Content: "ok"}); err != nil {
+		t.Fatalf("direct parent-child message rejected: %v", err)
+	}
+	if err := bus.Send(agent.A2AMessage{From: "main.1", To: "main", Type: agent.A2AMessageTaskResult, Content: "ok"}); err != nil {
+		t.Fatalf("direct child-parent message rejected: %v", err)
+	}
+	if err := bus.Send(agent.A2AMessage{From: "main.1", To: "main.2", Type: agent.A2AMessageTaskResult, Content: "bad"}); err == nil {
+		t.Fatal("sibling sub-agent message should be rejected")
+	}
+}
+
+func TestCoordinatorAsyncAwaitReturnsTaskNotificationXML(t *testing.T) {
+	llm := &fakeLLM{}
+	llm.streamFn = func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+		return []agent.StreamEvent{{Type: "text", Text: "worker async done"}, {Done: true}}
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Permission: agent.PermissionConfig{
+			Mode: agent.PermissionModeFullAuto,
+		},
+	})
+
+	notification, err := a.Coordinator().StartWorker(context.Background(), agent.WorkerTaskRequest{
+		Task: "async worker task",
+		Mode: agent.WorkerModeWorker,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notification.Status != agent.TaskStatusRunning || notification.AgentID != "main.1" {
+		t.Fatalf("unexpected start notification: %+v", notification)
+	}
+	if !strings.Contains(notification.String(), "<task-notification") {
+		t.Fatalf("notification should render XML: %s", notification.String())
+	}
+
+	done, err := a.Coordinator().AwaitTask(context.Background(), notification.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.Status != agent.TaskStatusCompleted || !strings.Contains(done.Content, "worker async done") {
+		t.Fatalf("unexpected completion notification: %+v", done)
+	}
+}
+
+func TestCoordinatorForkModeInheritsParentConversation(t *testing.T) {
+	const marker = "fork-parent-context-marker"
+	llm := &fakeLLM{}
+	llm.streamFn = func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+		if call == 0 {
+			return []agent.StreamEvent{{Type: "text", Text: "parent ready"}, {Done: true}}
+		}
+		formatted := agent.FormatMessages(messages)
+		if !strings.Contains(formatted, marker) {
+			t.Fatalf("fork worker did not inherit parent conversation:\n%s", formatted)
+		}
+		return []agent.StreamEvent{{Type: "text", Text: "fork worker done"}, {Done: true}}
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Permission: agent.PermissionConfig{
+			Mode: agent.PermissionModeFullAuto,
+		},
+	})
+	if _, err := a.RunToolLoop(context.Background(), "remember "+marker); err != nil {
+		t.Fatal(err)
+	}
+	notification, err := a.Coordinator().StartWorker(context.Background(), agent.WorkerTaskRequest{
+		Task: "fork task",
+		Mode: agent.WorkerModeFork,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := a.Coordinator().AwaitTask(context.Background(), notification.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.Status != agent.TaskStatusCompleted {
+		t.Fatalf("unexpected fork status: %+v", done)
+	}
+}
+
+func TestCoordinatorTaskStopKillsRunningWorker(t *testing.T) {
+	llm := &fakeLLM{}
+	llm.streamFn = func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+		<-ctx.Done()
+		return []agent.StreamEvent{{Err: ctx.Err(), Done: true}}
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Permission: agent.PermissionConfig{
+			Mode: agent.PermissionModeFullAuto,
+		},
+	})
+	notification, err := a.Coordinator().StartWorker(context.Background(), agent.WorkerTaskRequest{
+		Task: "long worker",
+		Mode: agent.WorkerModeWorker,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := a.Coordinator().StopTask(notification.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped.Status != agent.TaskStatusKilled {
+		t.Fatalf("expected killed task, got %+v", stopped)
 	}
 }
 

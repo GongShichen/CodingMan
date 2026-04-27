@@ -8,6 +8,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tool "github.com/GongShichen/CodingMan/tool"
@@ -15,6 +16,10 @@ import (
 
 type Agent struct {
 	mu                       sync.Mutex
+	id                       string
+	name                     string
+	parentID                 string
+	depth                    int
 	llm                      LLM
 	registry                 *tool.Registry
 	system                   string
@@ -26,6 +31,7 @@ type Agent struct {
 	maxParallelToolCalls     int
 	maxConsecutiveToolErrors int
 	maxConsecutiveAPIErrors  int
+	maxConcurrentSubAgents   int
 	enableToolBudget         bool
 	toolBudget               ToolBudget
 	enableAutoCompact        bool
@@ -38,6 +44,12 @@ type Agent struct {
 	enableStreamRecovery     bool
 	streamRecoveryMaxRetries int
 	logger                   Logger
+	a2a                      *A2ABus
+	coordinator              *Coordinator
+	coordinationConfig       CoordinationConfig
+	nextChildIndex           atomic.Uint64
+	maxSubAgentDepth         int
+	enableSelfReflection     bool
 }
 
 type AgentConfig struct {
@@ -51,14 +63,24 @@ type AgentConfig struct {
 	MaxParallelToolCalls     int
 	MaxConsecutiveToolErrors int
 	MaxConsecutiveAPIErrors  int
+	MaxConcurrentSubAgents   int
 	EnableToolBudget         bool
 	ToolBudget               ToolBudget
 	RetryConfig              RetryConfig
 	Permission               PermissionConfig
+	PermissionManager        *PermissionManager
 	PromptCache              PromptCacheConfig
 	EnableStreamRecovery     *bool
 	StreamRecoveryMaxRetries int
 	Logger                   Logger
+	A2ABus                   *A2ABus
+	Coordination             CoordinationConfig
+	ID                       string
+	Name                     string
+	ParentID                 string
+	Depth                    int
+	MaxSubAgentDepth         int
+	EnableSelfReflection     *bool
 }
 
 type ToolBudget struct {
@@ -73,6 +95,8 @@ const (
 	defaultMaxParallelToolCalls     = 4
 	defaultMaxConsecutiveToolErrors = 3
 	defaultMaxConsecutiveAPIErrors  = 3
+	defaultMaxSubAgentDepth         = 1
+	defaultMaxConcurrentSubAgents   = 4
 )
 
 func NewAgent(config AgentConfig) *Agent {
@@ -95,9 +119,13 @@ func NewAgent(config AgentConfig) *Agent {
 	if promptCacheConfig == (PromptCacheConfig{}) {
 		promptCacheConfig.Enabled = true
 	}
-	permissionConfig := config.Permission
-	if isZeroPermissionConfig(permissionConfig) {
-		permissionConfig = DefaultPermissionConfig()
+	permissionManager := config.PermissionManager
+	if permissionManager == nil {
+		permissionConfig := config.Permission
+		if isZeroPermissionConfig(permissionConfig) {
+			permissionConfig = DefaultPermissionConfig()
+		}
+		permissionManager = NewPermissionManager(permissionConfig)
 	}
 	logger := config.Logger
 	if logger == nil {
@@ -107,7 +135,24 @@ func NewAgent(config AgentConfig) *Agent {
 		loggerAware.SetLogger(logger)
 	}
 
+	id := strings.TrimSpace(config.ID)
+	if id == "" {
+		id = "main"
+	}
+	name := strings.TrimSpace(config.Name)
+	if name == "" {
+		name = id
+	}
+	a2aBus := config.A2ABus
+	if a2aBus == nil {
+		a2aBus = NewA2ABus()
+	}
+
 	agent := &Agent{
+		id:                       id,
+		name:                     name,
+		parentID:                 strings.TrimSpace(config.ParentID),
+		depth:                    config.Depth,
 		llm:                      config.LLM,
 		registry:                 registry,
 		system:                   system,
@@ -118,6 +163,7 @@ func NewAgent(config AgentConfig) *Agent {
 		maxParallelToolCalls:     defaultPositiveInt(config.MaxParallelToolCalls, defaultMaxParallelToolCalls),
 		maxConsecutiveToolErrors: defaultPositiveInt(config.MaxConsecutiveToolErrors, defaultMaxConsecutiveToolErrors),
 		maxConsecutiveAPIErrors:  defaultPositiveInt(config.MaxConsecutiveAPIErrors, defaultMaxConsecutiveAPIErrors),
+		maxConcurrentSubAgents:   defaultPositiveInt(config.MaxConcurrentSubAgents, defaultMaxConcurrentSubAgents),
 		enableToolBudget:         config.EnableToolBudget,
 		toolBudget:               config.ToolBudget,
 		enableAutoCompact:        contextConfig.AutoCompact,
@@ -125,12 +171,19 @@ func NewAgent(config AgentConfig) *Agent {
 		autoCompactKeepRecent:    defaultAutoCompactKeepRecent(contextConfig.KeepRecentRounds),
 		contextConfig:            contextConfig,
 		retryConfig:              defaultRetryConfig(config.RetryConfig),
-		permission:               NewPermissionManager(permissionConfig),
+		permission:               permissionManager,
 		promptCache:              normalizePromptCacheConfig(promptCacheConfig),
 		enableStreamRecovery:     defaultBool(config.EnableStreamRecovery, true),
 		streamRecoveryMaxRetries: defaultStreamRecoveryMaxRetries(config.StreamRecoveryMaxRetries, config.RetryConfig.MaxRetries),
 		logger:                   logger,
+		a2a:                      a2aBus,
+		coordinationConfig:       config.Coordination,
+		maxSubAgentDepth:         defaultPositiveInt(config.MaxSubAgentDepth, defaultMaxSubAgentDepth),
+		enableSelfReflection:     defaultBool(config.EnableSelfReflection, true),
 	}
+	agent.a2a.RegisterAgent(agent.id, agent.parentID)
+	agent.coordinator = NewCoordinator(agent, config.Coordination)
+	agent.registerInternalTools()
 
 	return agent
 }
@@ -180,6 +233,18 @@ func NewAgentFromLLMConfig(llmConfig LLMConfig, contextConfig ContextConfig, mod
 		Context: contextConfig,
 		Model:   model,
 	}), nil
+}
+
+func (agent *Agent) registerInternalTools() {
+	if agent == nil || agent.registry == nil {
+		return
+	}
+	if agent.depth > 0 {
+		return
+	}
+	if err := agent.registry.Register(newSubAgentTool(agent)); err != nil && !errors.Is(err, tool.ErrToolAlreadyRegistered) {
+		agent.log("", "register_internal_tool subagent error=%v", err)
+	}
 }
 
 func (agent *Agent) HandleStreamEvent(event StreamEvent) {
@@ -258,6 +323,60 @@ func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBl
 
 	agent.appendAssistantMessage(resp.Content)
 
+	return resp, nil
+}
+
+func (agent *Agent) Plan(ctx context.Context, prompt string, blocks ...ContentBlock) (LLMResponse, error) {
+	ctx, traceID := ensureTrace(ctx)
+	agent.log(traceID, "plan start prompt_chars=%d blocks=%d", len(prompt), len(blocks))
+	agent.log(traceID, "plan user message:\n%s", formatContentForLog(prompt, blocks))
+	defer agent.log(traceID, "plan end")
+
+	content := make([]ContentBlock, 0, len(blocks)+1)
+	planPrompt := strings.TrimSpace(prompt)
+	if planPrompt != "" {
+		content = append(content, TextBlock("Plan mode: propose a concise implementation plan for the following request. Do not call tools and do not modify files. Include verification steps and risks.\n\n"+planPrompt))
+	}
+	content = append(content, blocks...)
+	if len(content) == 0 {
+		return LLMResponse{}, errors.New("plan request must contain text or content blocks")
+	}
+
+	agent.mu.Lock()
+	if agent.llm == nil {
+		agent.mu.Unlock()
+		agent.log(traceID, "plan error=agent llm is nil")
+		return LLMResponse{StopReason: "agent is nil"}, errors.New("agent llm is nil")
+	}
+
+	var system *string
+	if agent.system != "" {
+		planSystem := agent.system + "\n\n## Plan Mode\nYou are in plan mode. Produce a practical plan only. Do not request or execute tool calls."
+		system = &planSystem
+	}
+	messagesSnapshot := agent.snapshotMessagesLocked()
+	messagesSnapshot = append(messagesSnapshot, Message{
+		Role:    "user",
+		Content: content,
+	})
+	model := agent.model
+	llm := agent.llm
+	retryConfig := agent.retryConfig
+	promptCache := agent.promptCache
+	agent.mu.Unlock()
+	agent.log(traceID, "plan llm_request model=%s messages=%d", model, len(messagesSnapshot))
+
+	resp, err := retryChat(ctx, llm, messagesSnapshot, ChatOptions{
+		System:      system,
+		Model:       model,
+		PromptCache: promptCache,
+	}, retryConfig)
+	if err != nil {
+		agent.log(traceID, "plan llm_error retry=%d error=%v", resp.RetryAttempts, err)
+		return LLMResponse{StopReason: err.Error()}, err
+	}
+	agent.log(traceID, "plan llm_response stop=%s input=%d output=%d retry=%d", resp.StopReason, resp.InputTokens, resp.OutputTokens, resp.RetryAttempts)
+	agent.log(traceID, "plan assistant message:\n%s", formatAssistantResponseForLog(resp))
 	return resp, nil
 }
 
@@ -486,6 +605,25 @@ func (agent *Agent) Clear() {
 
 	agent.turns = 0
 	agent.messages = agent.messages[:0]
+}
+
+func (agent *Agent) ID() string {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return agent.id
+}
+
+func (agent *Agent) A2AMessages() []A2AMessage {
+	agent.mu.Lock()
+	bus := agent.a2a
+	agent.mu.Unlock()
+	return bus.Messages()
+}
+
+func (agent *Agent) Coordinator() *Coordinator {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return agent.coordinator
 }
 
 func (agent *Agent) SystemPrompt() string {
@@ -1100,6 +1238,7 @@ func (agent *Agent) executePreparedToolBatch(ctx context.Context, toolUses []Too
 
 type preparedToolExecution struct {
 	toolUse          ToolUse
+	ctx              context.Context
 	name             string
 	input            map[string]any
 	parallelSafe     bool
@@ -1162,6 +1301,7 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 			Name:  name,
 			Input: mustMarshalToolInput(input),
 		},
+		ctx:              ctx,
 		name:             name,
 		input:            input,
 		parallelSafe:     permissionCheck.ParallelSafe,
@@ -1187,7 +1327,17 @@ func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution
 }
 
 func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, error) {
-	result, err := prepared.registry.Call(prepared.name, prepared.input)
+	toolInstance, getErr := prepared.registry.Get(prepared.name)
+	if getErr != nil {
+		return "", getErr
+	}
+	var result string
+	var err error
+	if contextual, ok := toolInstance.(contextualTool); ok {
+		result, err = contextual.CallContext(prepared.ctx, prepared.input)
+	} else {
+		result, err = toolInstance.Call(prepared.input)
+	}
 	if prepared.enableToolBudget {
 		truncated, truncateErr := tool.TruncateToolResult(result, prepared.toolBudget.MaxLen, prepared.toolBudget.HeadLen, prepared.toolBudget.TailLen)
 		if truncateErr != nil && err == nil {
@@ -1198,6 +1348,10 @@ func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, er
 		}
 	}
 	return result, err
+}
+
+type contextualTool interface {
+	CallContext(context.Context, map[string]any) (string, error)
 }
 
 func mustMarshalToolInput(input map[string]any) string {
