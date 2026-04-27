@@ -7,6 +7,7 @@ require github.com/GongShichen/CodingMan/agent v0.0.0
 require (
 	github.com/GongShichen/CodingMan/tool v0.0.0 // indirect
 	golang.org/x/sys v0.34.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 require (

@@ -3,6 +3,7 @@ package agent_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/GongShichen/CodingMan/agent"
@@ -66,6 +67,45 @@ func TestSessionStorePersistsAndLoadsLatestSnapshot(t *testing.T) {
 	}
 	if latest.SessionID != sessionID {
 		t.Fatalf("latest session id = %q, want %q", latest.SessionID, sessionID)
+	}
+}
+
+func TestSessionStoreCompactsSnapshotLog(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	projectDir := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := agent.NewSessionStore(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "session-compact"
+	for i := 0; i < 55; i++ {
+		if err := store.AppendSnapshot(agent.SessionSnapshot{
+			SessionID: sessionID,
+			Messages: []agent.Message{{
+				Role:    "user",
+				Content: []agent.ContentBlock{agent.TextBlock("hello")},
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(store.SessionPath(sessionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(strings.TrimSpace(string(data)), "\n") + 1; lines > 50 {
+		t.Fatalf("session log was not compacted, lines=%d", lines)
+	}
+	loaded, err := store.Load(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SessionID != sessionID {
+		t.Fatalf("loaded session id = %q", loaded.SessionID)
 	}
 }
 

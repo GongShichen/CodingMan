@@ -9,10 +9,13 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const defaultAgentsMDMaxBytes = 40000
 const defaultMemoryMaxChars = 40000
+const defaultProgressiveMemoryMaxChars = 12000
 
 const DefaultCodingSystemPrompt = `You are CodingMan, an autonomous coding agent running inside the user's local repository.
 
@@ -49,27 +52,29 @@ Tool and filesystem rules:
 You are not a general chatbot in this session. Stay focused on the coding task and the repository.`
 
 type ContextConfig struct {
-	Cwd              string
-	ProjectRoot      string
-	BaseSystem       string
-	IncludeDate      bool
-	LoadAgentsMD     bool
-	AutoCompact      bool
-	CompactThreshold int
-	KeepRecentRounds int
-	MaxAgentsMDBytes int
+	Cwd                       string
+	ProjectRoot               string
+	BaseSystem                string
+	IncludeDate               bool
+	LoadAgentsMD              bool
+	AutoCompact               bool
+	CompactThreshold          int
+	KeepRecentRounds          int
+	MaxAgentsMDBytes          int
+	ProgressiveMemoryMaxChars int
 }
 
 func DefaultContextConfig() ContextConfig {
 	return ContextConfig{
-		Cwd:              ".",
-		BaseSystem:       DefaultCodingSystemPrompt + "\n\n" + CoordinatorSystemPrompt,
-		IncludeDate:      true,
-		LoadAgentsMD:     true,
-		AutoCompact:      true,
-		CompactThreshold: defaultAutoCompactSizeThreshold,
-		KeepRecentRounds: defaultAutoCompactRecentRounds,
-		MaxAgentsMDBytes: defaultAgentsMDMaxBytes,
+		Cwd:                       ".",
+		BaseSystem:                DefaultCodingSystemPrompt + "\n\n" + CoordinatorSystemPrompt,
+		IncludeDate:               true,
+		LoadAgentsMD:              true,
+		AutoCompact:               true,
+		CompactThreshold:          defaultAutoCompactSizeThreshold,
+		KeepRecentRounds:          defaultAutoCompactRecentRounds,
+		MaxAgentsMDBytes:          defaultAgentsMDMaxBytes,
+		ProgressiveMemoryMaxChars: defaultProgressiveMemoryMaxChars,
 	}
 }
 
@@ -93,9 +98,16 @@ func normalizeContextConfig(config ContextConfig) ContextConfig {
 	if config.MaxAgentsMDBytes <= 0 {
 		config.MaxAgentsMDBytes = defaults.MaxAgentsMDBytes
 	}
+	if config.ProgressiveMemoryMaxChars <= 0 {
+		config.ProgressiveMemoryMaxChars = defaults.ProgressiveMemoryMaxChars
+	}
+	if config.ProgressiveMemoryMaxChars > config.MaxAgentsMDBytes {
+		config.ProgressiveMemoryMaxChars = config.MaxAgentsMDBytes
+	}
 	return config
 }
 
+// Deprecated: use LoadProjectMemory or LoadProjectMemoryWithWarnings.
 func FindAgentsMD(startDir string) (string, error) {
 	/*
 		从指定目录向上递归查找AGENTS.md文件，
@@ -143,6 +155,7 @@ func FindAgentsMD(startDir string) (string, error) {
 	}
 }
 
+// Deprecated: use LoadProjectMemory or LoadProjectMemoryWithWarnings.
 func LoadAgentsMD(startDir string) (string, error) {
 	filePath, err := FindAgentsMD(startDir)
 	if err != nil {
@@ -173,10 +186,14 @@ func BuildSystemPromptWithConfig(config ContextConfig) (string, error) {
 	}
 
 	if config.LoadAgentsMD {
-		agentsMD, _ := LoadProjectMemory(config)
-		if agentsMD != "" {
+		memoryResult := LoadProjectMemoryWithWarnings(config)
+		if memoryResult.Content != "" {
 			parts = append(parts, "## 项目记忆与规则\n")
-			parts = append(parts, agentsMD)
+			parts = append(parts, memoryResult.Content)
+		}
+		if len(memoryResult.Warnings) > 0 {
+			parts = append(parts, "## 项目记忆加载警告\n")
+			parts = append(parts, strings.Join(memoryResult.Warnings, "\n"))
 		}
 	}
 
@@ -208,14 +225,28 @@ type memoryLoadContext struct {
 	maxChars    int
 	usedChars   int
 	visited     map[string]struct{}
+	warnings    []string
 }
 
 func LoadProjectMemory(config ContextConfig) (string, error) {
+	result := LoadProjectMemoryWithWarnings(config)
+	if len(result.Warnings) > 0 {
+		return result.Content, fmt.Errorf("project memory warnings: %s", strings.Join(result.Warnings, "; "))
+	}
+	return result.Content, nil
+}
+
+type ProjectMemoryResult struct {
+	Content  string
+	Warnings []string
+}
+
+func LoadProjectMemoryWithWarnings(config ContextConfig) ProjectMemoryResult {
 	config = normalizeContextConfig(config)
 	ctx := &memoryLoadContext{
 		projectRoot: cleanRealPath(config.ProjectRoot),
 		cwd:         cleanRealPath(config.Cwd),
-		maxChars:    config.MaxAgentsMDBytes,
+		maxChars:    config.ProgressiveMemoryMaxChars,
 		visited:     make(map[string]struct{}),
 	}
 	if ctx.maxChars <= 0 {
@@ -226,17 +257,51 @@ func LoadProjectMemory(config ContextConfig) (string, error) {
 	files = append(files, projectMemoryFiles(ctx.projectRoot, ctx.cwd)...)
 
 	var parts []string
-	for _, file := range files {
+	var deferredFiles []string
+	for index, file := range files {
 		content, err := ctx.loadMemoryFile(file, filepath.Dir(file))
-		if err != nil || strings.TrimSpace(content) == "" {
+		if err != nil {
+			ctx.warn("%s: %v", file, err)
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("### %s\n%s", file, content))
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		part := fmt.Sprintf("### %s\n%s", file, content)
+		part, ok := ctx.consume(part)
+		if !ok {
+			deferredFiles = append(deferredFiles, file)
+			deferredFiles = append(deferredFiles, files[index+1:]...)
+			break
+		}
+		parts = append(parts, part)
 		if ctx.usedChars >= ctx.maxChars {
+			if strings.Contains(part, "[project memory truncated]") {
+				deferredFiles = append(deferredFiles, file)
+			}
+			deferredFiles = append(deferredFiles, files[index+1:]...)
 			break
 		}
 	}
-	return strings.Join(parts, "\n\n"), nil
+	if len(deferredFiles) > 0 {
+		parts = append(parts, progressiveMemoryIndex(uniqueStrings(deferredFiles)))
+	}
+	return ProjectMemoryResult{Content: strings.Join(parts, "\n\n"), Warnings: append([]string(nil), ctx.warnings...)}
+}
+
+func progressiveMemoryIndex(files []string) string {
+	if len(files) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString("## 渐进式加载索引\n")
+	builder.WriteString("以下项目记忆文件未完整注入当前 system prompt。任务需要更细规则时，使用 read/grep 按需加载对应文件：\n")
+	for _, file := range files {
+		builder.WriteString("- ")
+		builder.WriteString(file)
+		builder.WriteString("\n")
+	}
+	return strings.TrimSpace(builder.String())
 }
 
 func userMemoryFiles() []string {
@@ -310,7 +375,11 @@ func (ctx *memoryLoadContext) loadMemoryFile(path string, includeBase string) (s
 		return "", err
 	}
 	body, frontmatter := splitFrontmatter(string(data))
-	if !frontmatterMatches(frontmatter, ctx.cwd, ctx.projectRoot) {
+	matches, err := frontmatterMatches(frontmatter, ctx.cwd, ctx.projectRoot)
+	if err != nil {
+		return "", err
+	}
+	if !matches {
 		return "", nil
 	}
 	body = stripHTMLComments(body)
@@ -319,17 +388,6 @@ func (ctx *memoryLoadContext) loadMemoryFile(path string, includeBase string) (s
 	if body == "" {
 		return "", nil
 	}
-	remaining := ctx.maxChars - ctx.usedChars
-	if remaining <= 0 {
-		return "", nil
-	}
-	if len([]rune(body)) > remaining {
-		runes := []rune(body)
-		body = string(runes[:remaining]) + "\n\n[project memory truncated]\n"
-		ctx.usedChars = ctx.maxChars
-		return body, nil
-	}
-	ctx.usedChars += len([]rune(body))
 	return body, nil
 }
 
@@ -346,10 +404,30 @@ func (ctx *memoryLoadContext) expandIncludes(content string, baseDir string) str
 		}
 		included, err := ctx.loadMemoryFile(includePath, filepath.Dir(includePath))
 		if err == nil {
-			lines[i] = included
+			lines[i] = fmt.Sprintf("### %s\n%s", includePath, included)
+		} else {
+			ctx.warn("include %s: %v", includePath, err)
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (ctx *memoryLoadContext) consume(text string) (string, bool) {
+	remaining := ctx.maxChars - ctx.usedChars
+	if remaining <= 0 {
+		return "", false
+	}
+	runes := []rune(text)
+	if len(runes) > remaining {
+		ctx.usedChars = ctx.maxChars
+		return string(runes[:remaining]) + "\n\n[project memory truncated]\n", true
+	}
+	ctx.usedChars += len(runes)
+	return text, true
+}
+
+func (ctx *memoryLoadContext) warn(format string, args ...any) {
+	ctx.warnings = append(ctx.warnings, fmt.Sprintf(format, args...))
 }
 
 func (ctx *memoryLoadContext) resolveInclude(token string, baseDir string) (string, bool) {
@@ -410,14 +488,17 @@ func splitFrontmatter(content string) (string, string) {
 	return body, front
 }
 
-func frontmatterMatches(frontmatter string, cwd string, projectRoot string) bool {
+func frontmatterMatches(frontmatter string, cwd string, projectRoot string) (bool, error) {
 	frontmatter = strings.TrimSpace(frontmatter)
 	if frontmatter == "" {
-		return true
+		return true, nil
 	}
-	patterns := frontmatterPathPatterns(frontmatter)
+	patterns, err := frontmatterPathPatterns(frontmatter)
+	if err != nil {
+		return false, err
+	}
 	if len(patterns) == 0 {
-		return true
+		return true, nil
 	}
 	rel, err := filepath.Rel(projectRoot, cwd)
 	if err != nil || strings.HasPrefix(rel, "..") {
@@ -426,50 +507,50 @@ func frontmatterMatches(frontmatter string, cwd string, projectRoot string) bool
 	rel = filepath.ToSlash(rel)
 	for _, pattern := range patterns {
 		if ok, _ := filepath.Match(filepath.ToSlash(pattern), rel); ok {
-			return true
+			return true, nil
 		}
 		if matched, _ := regexp.MatchString(pattern, rel); matched {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
-func frontmatterPathPatterns(frontmatter string) []string {
+func frontmatterPathPatterns(frontmatter string) ([]string, error) {
+	var decoded map[string]any
+	if err := yaml.Unmarshal([]byte(frontmatter), &decoded); err != nil {
+		return nil, err
+	}
 	var patterns []string
-	lines := strings.Split(frontmatter, "\n")
-	inPaths := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "paths:") || strings.HasPrefix(trimmed, "path:") || strings.HasPrefix(trimmed, "match:") || strings.HasPrefix(trimmed, "matches:") {
-			inPaths = strings.HasSuffix(trimmed, ":")
-			if value := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(trimmed, "paths:"), "path:"), "matches:"), "match:")); value != "" {
-				patterns = append(patterns, splitInlinePatterns(value)...)
-			}
-			continue
-		}
-		if inPaths && strings.HasPrefix(trimmed, "-") {
-			patterns = append(patterns, strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "-")), `"'`))
-			continue
-		}
-		inPaths = false
+	for _, key := range []string{"paths", "path", "match", "matches"} {
+		patterns = append(patterns, patternsFromYAMLValue(decoded[key])...)
 	}
-	return compactStrings(patterns)
+	return compactStrings(patterns), nil
 }
 
-func splitInlinePatterns(value string) []string {
-	value = strings.Trim(value, `[] "'`)
-	if value == "" {
+func patternsFromYAMLValue(value any) []string {
+	switch typed := value.(type) {
+	case nil:
 		return nil
+	case string:
+		return []string{typed}
+	case []any:
+		var result []string
+		for _, item := range typed {
+			result = append(result, patternsFromYAMLValue(item)...)
+		}
+		return result
+	case []string:
+		return typed
+	case map[string]any:
+		var result []string
+		for _, nested := range typed {
+			result = append(result, patternsFromYAMLValue(nested)...)
+		}
+		return result
+	default:
+		return []string{fmt.Sprint(typed)}
 	}
-	parts := strings.Split(value, ",")
-	for i := range parts {
-		parts[i] = strings.Trim(strings.TrimSpace(parts[i]), `"'`)
-	}
-	return compactStrings(parts)
 }
 
 var htmlCommentPattern = regexp.MustCompile(`(?s)<!--.*?-->`)
@@ -546,6 +627,7 @@ func compactStrings(values []string) []string {
 	return result
 }
 
+// Deprecated: use LoadProjectMemory or LoadProjectMemoryWithWarnings.
 func loadAgentsMDWithLimit(startDir string, maxBytes int) (string, error) {
 	filePath, err := FindAgentsMD(startDir)
 	if err != nil {

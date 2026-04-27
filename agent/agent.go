@@ -28,6 +28,14 @@ type Agent struct {
 	fileHistory              []FileHistoryEntry
 	attribution              []AttributionEntry
 	todos                    []TodoItem
+	sessionMemory            []SessionMemoryEntry
+	toolCallsSinceMemory     int
+	sessionMemoryThreshold   int
+	maxSessionMemoryEntries  int
+	maxSessionMemoryChars    int
+	crossMemoryStore         *CrossSessionMemoryStore
+	maxCrossMemoryChars      int
+	crossMemoryJobs          chan string
 	turns                    int
 	maxTurn                  int
 	maxToolCalls             int
@@ -68,6 +76,11 @@ type AgentConfig struct {
 	MaxConsecutiveToolErrors int
 	MaxConsecutiveAPIErrors  int
 	MaxConcurrentSubAgents   int
+	SessionMemoryThreshold   int
+	MaxSessionMemoryEntries  int
+	MaxSessionMemoryChars    int
+	EnableCrossSessionMemory *bool
+	MaxCrossMemoryChars      int
 	EnableToolBudget         bool
 	ToolBudget               ToolBudget
 	RetryConfig              RetryConfig
@@ -102,12 +115,23 @@ const (
 	defaultMaxConsecutiveAPIErrors  = 3
 	defaultMaxSubAgentDepth         = 1
 	defaultMaxConcurrentSubAgents   = 4
+	defaultSessionMemoryThreshold   = 10
+	defaultMaxSessionMemoryEntries  = 8
+	defaultMaxSessionMemoryChars    = 8000
+	defaultMaxCrossMemoryChars      = 12000
 )
 
 func NewAgent(config AgentConfig) *Agent {
 	registry := config.Registry
 	if registry == nil {
 		registry = tool.NewDefaultRegistry()
+	}
+	logger := config.Logger
+	if logger == nil {
+		logger = noopLogger{}
+	}
+	if loggerAware, ok := config.LLM.(LoggerAware); ok {
+		loggerAware.SetLogger(logger)
 	}
 
 	contextConfig := config.Context
@@ -119,6 +143,22 @@ func NewAgent(config AgentConfig) *Agent {
 	system := contextConfig.BaseSystem
 	if builtSystem, err := BuildSystemPromptWithConfig(contextConfig); err == nil {
 		system = builtSystem
+	} else {
+		logger.Log("", "build_system_prompt error=%v", err)
+	}
+	maxCrossMemoryChars := defaultPositiveInt(config.MaxCrossMemoryChars, defaultMaxCrossMemoryChars)
+	var crossMemoryStore *CrossSessionMemoryStore
+	var crossMemoryJobs chan string
+	if defaultBool(config.EnableCrossSessionMemory, true) {
+		if store, err := NewCrossSessionMemoryStore(contextConfig.ProjectRoot); err == nil {
+			crossMemoryStore = store
+			crossMemoryJobs = make(chan string, 1)
+			if memory := store.Render(maxCrossMemoryChars); strings.TrimSpace(memory) != "" {
+				system = system + "\n\n## Cross-Session Memory\n" + memory
+			}
+		} else {
+			logger.Log("", "cross_session_memory init_error=%v", err)
+		}
 	}
 	promptCacheConfig := config.PromptCache
 	if promptCacheConfig == (PromptCacheConfig{}) {
@@ -132,14 +172,6 @@ func NewAgent(config AgentConfig) *Agent {
 		}
 		permissionManager = NewPermissionManager(permissionConfig)
 	}
-	logger := config.Logger
-	if logger == nil {
-		logger = noopLogger{}
-	}
-	if loggerAware, ok := config.LLM.(LoggerAware); ok {
-		loggerAware.SetLogger(logger)
-	}
-
 	id := strings.TrimSpace(config.ID)
 	if id == "" {
 		id = "main"
@@ -166,6 +198,13 @@ func NewAgent(config AgentConfig) *Agent {
 		fileHistory:              make([]FileHistoryEntry, 0),
 		attribution:              make([]AttributionEntry, 0),
 		todos:                    make([]TodoItem, 0),
+		sessionMemory:            make([]SessionMemoryEntry, 0),
+		sessionMemoryThreshold:   defaultPositiveInt(config.SessionMemoryThreshold, defaultSessionMemoryThreshold),
+		maxSessionMemoryEntries:  defaultPositiveInt(config.MaxSessionMemoryEntries, defaultMaxSessionMemoryEntries),
+		maxSessionMemoryChars:    defaultPositiveInt(config.MaxSessionMemoryChars, defaultMaxSessionMemoryChars),
+		crossMemoryStore:         crossMemoryStore,
+		maxCrossMemoryChars:      maxCrossMemoryChars,
+		crossMemoryJobs:          crossMemoryJobs,
 		maxTurn:                  defaultMaxTurnValue(config.MaxLLMTurns, config.MaxTurn),
 		maxToolCalls:             defaultPositiveInt(config.MaxToolCalls, defaultMaxToolCalls),
 		maxParallelToolCalls:     defaultPositiveInt(config.MaxParallelToolCalls, defaultMaxParallelToolCalls),
@@ -193,6 +232,7 @@ func NewAgent(config AgentConfig) *Agent {
 	agent.a2a.RegisterAgent(agent.id, agent.parentID)
 	agent.coordinator = NewCoordinator(agent, config.Coordination)
 	agent.registerInternalTools()
+	agent.startCrossSessionMemoryWorker()
 
 	return agent
 }
@@ -305,8 +345,8 @@ func (agent *Agent) Chat(ctx context.Context, prompt string, blocks ...ContentBl
 	}
 
 	var system *string
-	if agent.system != "" {
-		system = &agent.system
+	if systemValue := agent.systemWithSessionMemoryLocked(); systemValue != "" {
+		system = &systemValue
 	}
 	messagesSnapshot := agent.snapshotMessagesLocked()
 	model := agent.model
@@ -359,8 +399,8 @@ func (agent *Agent) Plan(ctx context.Context, prompt string, blocks ...ContentBl
 	}
 
 	var system *string
-	if agent.system != "" {
-		planSystem := agent.system + "\n\n## Plan Mode\nYou are in plan mode. Produce a practical plan only. Do not request or execute tool calls."
+	if systemValue := agent.systemWithSessionMemoryLocked(); systemValue != "" {
+		planSystem := systemValue + "\n\n## Plan Mode\nYou are in plan mode. Produce a practical plan only. Do not request or execute tool calls."
 		system = &planSystem
 	}
 	messagesSnapshot := agent.snapshotMessagesLocked()
@@ -431,8 +471,8 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		}
 
 		var system *string
-		if agent.system != "" {
-			system = &agent.system
+		if systemValue := agent.systemWithSessionMemoryLocked(); systemValue != "" {
+			system = &systemValue
 		}
 		messagesSnapshot := agent.snapshotMessagesLocked()
 		model := agent.model
@@ -480,6 +520,9 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 
 		toolCalls += len(toolUses)
 		agent.appendToolResultMessages(results)
+		if agent.MaybeUpdateSessionMemory(ctx) {
+			agent.log(traceID, "session_memory updated total=%d", len(agent.SessionMemory()))
+		}
 		agent.log(traceID, "tool_loop tool_results count=%d total_tool_calls=%d", len(results), toolCalls)
 		for _, result := range results {
 			agent.log(traceID, "tool result id=%s name=%s error=%v:\n%s", result.ToolUse.ID, result.ToolUse.Name, result.IsError, result.Content)
@@ -532,8 +575,8 @@ func (agent *Agent) Stream(ctx context.Context, prompt string, blocks ...Content
 	}
 
 	var system *string
-	if agent.system != "" {
-		system = &agent.system
+	if systemValue := agent.systemWithSessionMemoryLocked(); systemValue != "" {
+		system = &systemValue
 	}
 	messagesSnapshot := agent.snapshotMessagesLocked()
 	model := agent.model
@@ -666,6 +709,16 @@ func (agent *Agent) SetBaseSystemPrompt(baseSystem string) error {
 	}
 
 	agent.mu.Lock()
+	crossMemoryStore := agent.crossMemoryStore
+	crossMemoryLimit := agent.maxCrossMemoryChars
+	agent.mu.Unlock()
+	if crossMemoryStore != nil {
+		if memory := crossMemoryStore.Render(crossMemoryLimit); strings.TrimSpace(memory) != "" {
+			system = system + "\n\n## Cross-Session Memory\n" + memory
+		}
+	}
+
+	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	agent.contextConfig = normalizeContextConfig(contextConfig)
 	agent.system = system
@@ -765,6 +818,7 @@ func (agent *Agent) Snapshot(sessionID string, projectDir string) SessionSnapsho
 		FileHistory: append([]FileHistoryEntry(nil), agent.fileHistory...),
 		Attribution: append([]AttributionEntry(nil), agent.attribution...),
 		Todos:       append([]TodoItem(nil), agent.todos...),
+		Memory:      append([]SessionMemoryEntry(nil), agent.sessionMemory...),
 		UpdatedAt:   time.Now().UTC(),
 	}
 }
@@ -776,6 +830,8 @@ func (agent *Agent) Restore(snapshot SessionSnapshot) {
 	agent.fileHistory = append([]FileHistoryEntry(nil), snapshot.FileHistory...)
 	agent.attribution = append([]AttributionEntry(nil), snapshot.Attribution...)
 	agent.todos = append([]TodoItem(nil), snapshot.Todos...)
+	agent.sessionMemory = append([]SessionMemoryEntry(nil), snapshot.Memory...)
+	agent.toolCallsSinceMemory = 0
 	agent.turns = countAssistantTurns(agent.messages)
 }
 
@@ -787,6 +843,253 @@ func countAssistantTurns(messages []Message) int {
 		}
 	}
 	return count
+}
+
+func (agent *Agent) RecordToolCall(toolName string) {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.toolCallsSinceMemory++
+}
+
+func (agent *Agent) MaybeUpdateSessionMemory(ctxs ...context.Context) bool {
+	agent.mu.Lock()
+	if agent.sessionMemoryThreshold <= 0 || agent.toolCallsSinceMemory < agent.sessionMemoryThreshold {
+		agent.mu.Unlock()
+		return false
+	}
+	toolCallCount := agent.toolCallsSinceMemory
+	fileHistoryCount := len(agent.fileHistory)
+	fallbackContent := agent.buildSessionMemoryLocked()
+	messagesSnapshot := agent.snapshotMessagesLocked()
+	fileHistory := append([]FileHistoryEntry(nil), agent.fileHistory...)
+	attribution := append([]AttributionEntry(nil), agent.attribution...)
+	todos := append([]TodoItem(nil), agent.todos...)
+	llm := agent.llm
+	model := agent.model
+	promptCache := agent.promptCache
+	agent.mu.Unlock()
+
+	content := fallbackContent
+	if llm != nil {
+		ctx := context.Background()
+		if len(ctxs) > 0 && ctxs[0] != nil {
+			ctx = ctxs[0]
+		}
+		if summary := agent.summarizeSessionMemory(ctx, llm, model, promptCache, messagesSnapshot, fileHistory, attribution, todos); strings.TrimSpace(summary) != "" {
+			content = summary
+		}
+	}
+
+	agent.mu.Lock()
+	entry := SessionMemoryEntry{
+		ID:               fmt.Sprintf("memory-%d", len(agent.sessionMemory)+1),
+		Content:          strings.TrimSpace(content),
+		ToolCallCount:    toolCallCount,
+		FileHistoryCount: fileHistoryCount,
+		CreatedAt:        time.Now().UTC(),
+	}
+	agent.sessionMemory = append(agent.sessionMemory, entry)
+	agent.pruneSessionMemoryLocked()
+	agent.toolCallsSinceMemory = 0
+	agent.mu.Unlock()
+
+	return true
+}
+
+func (agent *Agent) ExtractCrossSessionMemory(ctx context.Context) error {
+	ctx, traceID := ensureTrace(ctx)
+	agent.mu.Lock()
+	store := agent.crossMemoryStore
+	llm := agent.llm
+	model := agent.model
+	promptCache := agent.promptCache
+	limit := agent.maxCrossMemoryChars
+	if store == nil || llm == nil {
+		agent.mu.Unlock()
+		return nil
+	}
+	fallbackContent := agent.buildSessionMemoryLocked()
+	messagesSnapshot := agent.snapshotMessagesLocked()
+	fileHistory := append([]FileHistoryEntry(nil), agent.fileHistory...)
+	attribution := append([]AttributionEntry(nil), agent.attribution...)
+	todos := append([]TodoItem(nil), agent.todos...)
+	agent.mu.Unlock()
+
+	content := fallbackContent
+	if summary := agent.summarizeSessionMemory(ctx, llm, model, promptCache, messagesSnapshot, fileHistory, attribution, todos); strings.TrimSpace(summary) != "" {
+		content = summary
+	}
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	agent.log(traceID, "cross_session_memory extract start content_chars=%d", len(content))
+	if err := store.Update(ctx, llm, model, promptCache, content, limit); err != nil {
+		agent.log(traceID, "cross_session_memory extract_error=%v", err)
+		return err
+	}
+	agent.log(traceID, "cross_session_memory extract completed dir=%s", store.Dir())
+	return nil
+}
+
+func (agent *Agent) ScheduleCrossSessionMemoryExtraction(ctx context.Context) bool {
+	ctx, traceID := ensureTrace(ctx)
+	agent.mu.Lock()
+	jobs := agent.crossMemoryJobs
+	agent.mu.Unlock()
+	if jobs == nil {
+		return false
+	}
+	select {
+	case jobs <- traceID:
+		agent.log(traceID, "cross_session_memory scheduled")
+		return true
+	default:
+		agent.log(traceID, "cross_session_memory schedule_skipped reason=busy")
+		return false
+	}
+}
+
+func (agent *Agent) startCrossSessionMemoryWorker() {
+	agent.mu.Lock()
+	jobs := agent.crossMemoryJobs
+	agent.mu.Unlock()
+	if jobs == nil {
+		return
+	}
+	go func() {
+		for traceID := range jobs {
+			ctx := WithTraceID(context.Background(), traceID)
+			if err := agent.ExtractCrossSessionMemory(ctx); err != nil {
+				agent.log(traceID, "cross_session_memory worker_error=%v", err)
+			}
+		}
+	}()
+}
+
+func (agent *Agent) summarizeSessionMemory(ctx context.Context, llm LLM, model string, promptCache PromptCacheConfig, messages []Message, fileHistory []FileHistoryEntry, attribution []AttributionEntry, todos []TodoItem) string {
+	var builder strings.Builder
+	builder.WriteString("请更新 coding agent 的会话记忆。提取长期有用的信息，不要流水账：\n")
+	builder.WriteString("- 用户偏好、明确约束和反复强调的要求\n")
+	builder.WriteString("- 重要设计决策、失败原因、当前任务状态\n")
+	builder.WriteString("- 关键文件、所有权、后续待办\n\n")
+	builder.WriteString("最近对话：\n")
+	builder.WriteString(FormatMessages(messages))
+	builder.WriteString("\n\n文件历史：\n")
+	for _, item := range fileHistory {
+		builder.WriteString(fmt.Sprintf("- %s %s by %s\n", item.Action, item.Path, item.AgentID))
+	}
+	builder.WriteString("\nAttribution：\n")
+	for _, item := range attribution {
+		builder.WriteString(fmt.Sprintf("- %s by %s %s\n", item.Path, item.AgentID, item.Note))
+	}
+	builder.WriteString("\nTodos：\n")
+	for _, item := range todos {
+		builder.WriteString(fmt.Sprintf("- [%s] %s\n", item.Status, item.Content))
+	}
+	resp, err := llm.Chat(ctx, []Message{{Role: "user", Content: []ContentBlock{TextBlock(builder.String())}}}, ChatOptions{
+		Model:       model,
+		PromptCache: promptCache,
+	})
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(resp.Content)
+}
+
+func (agent *Agent) pruneSessionMemoryLocked() {
+	if agent.maxSessionMemoryEntries > 0 && len(agent.sessionMemory) > agent.maxSessionMemoryEntries {
+		agent.sessionMemory = append([]SessionMemoryEntry(nil), agent.sessionMemory[len(agent.sessionMemory)-agent.maxSessionMemoryEntries:]...)
+	}
+	if agent.maxSessionMemoryChars <= 0 {
+		return
+	}
+	for totalSessionMemoryChars(agent.sessionMemory) > agent.maxSessionMemoryChars && len(agent.sessionMemory) > 1 {
+		agent.sessionMemory = agent.sessionMemory[1:]
+	}
+}
+
+func totalSessionMemoryChars(memories []SessionMemoryEntry) int {
+	total := 0
+	for _, memory := range memories {
+		total += len([]rune(memory.Content))
+	}
+	return total
+}
+
+func (agent *Agent) buildSessionMemoryLocked() string {
+	var builder strings.Builder
+	builder.WriteString("Recent session facts:\n")
+	if len(agent.fileHistory) > 0 {
+		builder.WriteString("- Files touched:\n")
+		start := len(agent.fileHistory) - 10
+		if start < 0 {
+			start = 0
+		}
+		for _, item := range agent.fileHistory[start:] {
+			builder.WriteString(fmt.Sprintf("  - %s %s\n", item.Action, item.Path))
+		}
+	}
+	if len(agent.attribution) > 0 {
+		builder.WriteString("- Attribution:\n")
+		start := len(agent.attribution) - 10
+		if start < 0 {
+			start = 0
+		}
+		for _, item := range agent.attribution[start:] {
+			builder.WriteString(fmt.Sprintf("  - %s by %s %s\n", item.Path, item.AgentID, item.Note))
+		}
+	}
+	if len(agent.todos) > 0 {
+		builder.WriteString("- Todos:\n")
+		for _, item := range agent.todos {
+			builder.WriteString(fmt.Sprintf("  - [%s] %s\n", item.Status, item.Content))
+		}
+	}
+	if builder.Len() == len("Recent session facts:\n") {
+		builder.WriteString("- Tool activity occurred, no file-specific facts recorded.\n")
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func (agent *Agent) SessionMemory() []SessionMemoryEntry {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return append([]SessionMemoryEntry(nil), agent.sessionMemory...)
+}
+
+func (agent *Agent) systemWithSessionMemoryLocked() string {
+	system := agent.system
+	if len(agent.sessionMemory) == 0 {
+		return system
+	}
+	var builder strings.Builder
+	builder.WriteString(system)
+	builder.WriteString("\n\n## Session Memory\n")
+	remaining := agent.maxSessionMemoryChars
+	if remaining <= 0 {
+		remaining = defaultMaxSessionMemoryChars
+	}
+	start := 0
+	if agent.maxSessionMemoryEntries > 0 && len(agent.sessionMemory) > agent.maxSessionMemoryEntries {
+		start = len(agent.sessionMemory) - agent.maxSessionMemoryEntries
+	}
+	for _, memory := range agent.sessionMemory[start:] {
+		if remaining <= 0 {
+			break
+		}
+		content := memory.Content
+		runes := []rune(content)
+		if len(runes) > remaining {
+			content = string(runes[:remaining]) + "\n[session memory truncated]"
+			remaining = 0
+		} else {
+			remaining -= len(runes)
+		}
+		builder.WriteString("- ")
+		builder.WriteString(content)
+		builder.WriteString("\n")
+	}
+	return builder.String()
 }
 
 func (agent *Agent) Registry() *tool.Registry {
@@ -854,19 +1157,23 @@ func (agent *Agent) autoCompactMessagesIfNeeded(ctx context.Context) {
 	toolBudget := agent.toolBudget
 	model := agent.model
 	promptCache := agent.promptCache
+	agent.pruneSessionMemoryLocked()
 	var system *string
-	if agent.system != "" {
-		systemValue := agent.system
+	systemValue := agent.systemWithSessionMemoryLocked()
+	if systemValue != "" {
 		system = &systemValue
 	}
-	if !enabled || llm == nil || threshold <= 0 || EstimateMessagesSize(agent.messages) <= threshold {
+	messagesSize := EstimateMessagesSize(agent.messages)
+	systemSize := len(systemValue)
+	totalSize := messagesSize + systemSize
+	if !enabled || llm == nil || threshold <= 0 || totalSize <= threshold {
 		agent.mu.Unlock()
 		return
 	}
-	beforeSize := EstimateMessagesSize(agent.messages)
+	beforeSize := messagesSize
 	messagesSnapshot := agent.snapshotMessagesLocked()
 	agent.mu.Unlock()
-	agent.log(traceID, "compact start messages=%d size=%d threshold=%d keep_recent=%d", len(messagesSnapshot), beforeSize, threshold, keepRecent)
+	agent.log(traceID, "compact start messages=%d message_size=%d system_size=%d total_size=%d threshold=%d keep_recent=%d", len(messagesSnapshot), beforeSize, systemSize, totalSize, threshold, keepRecent)
 
 	compacted := CompactMessagesWithOptions(messagesSnapshot, llm, CompactOptions{
 		KeepRecentRounds: keepRecent,
@@ -906,8 +1213,10 @@ func (agent *Agent) ExecuteTool(ctx context.Context, toolUse map[string]any) (st
 	if result.IsError {
 		err := errors.New(result.Content)
 		agent.log(traceID, "execute_tool name=%s error=%v", prepared.name, err)
+		agent.MaybeUpdateSessionMemory(prepared.ctx)
 		return result.Content, err
 	}
+	agent.MaybeUpdateSessionMemory(prepared.ctx)
 	agent.log(traceID, "execute_tool name=%s result_chars=%d", prepared.name, len(result.Content))
 	return result.Content, nil
 }
@@ -1381,6 +1690,7 @@ func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution
 		result.ToolUse = prepared.toolUse
 	}
 	content, err := agent.callPreparedTool(prepared)
+	agent.RecordToolCall(prepared.name)
 	agent.recordToolFileActivity(prepared)
 	if err != nil {
 		agent.log(traceID, "tool_execute error name=%s id=%s output_chars=%d error=%v", prepared.name, prepared.toolUse.ID, len(content), err)

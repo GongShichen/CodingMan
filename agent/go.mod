@@ -6,6 +6,7 @@ require (
 	github.com/GongShichen/CodingMan/tool v0.0.0
 	github.com/anthropics/anthropic-sdk-go v1.37.0
 	github.com/openai/openai-go/v3 v3.31.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

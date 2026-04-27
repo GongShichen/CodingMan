@@ -39,21 +39,25 @@ type RuntimeConfig struct {
 	APIKey    string
 	BaseURL   string
 
-	Context          agent.ContextConfig
-	MaxLLMTurns      int
-	MaxToolCalls     int
-	MaxParallelTools int
-	MaxToolErrors    int
-	MaxAPIErrors     int
-	MaxSubAgentDepth int
-	MaxSubAgents     int
-	EnableToolBudget bool
-	ToolBudget       agent.ToolBudget
-	Retry            agent.RetryConfig
-	PromptCache      agent.PromptCacheConfig
-	Coordination     agent.CoordinationConfig
-	Hooks            *agent.HookManager
-	LogPath          string
+	Context                 agent.ContextConfig
+	MaxLLMTurns             int
+	MaxToolCalls            int
+	MaxParallelTools        int
+	MaxToolErrors           int
+	MaxAPIErrors            int
+	MaxSubAgentDepth        int
+	MaxSubAgents            int
+	SessionMemoryThreshold  int
+	MaxSessionMemoryEntries int
+	MaxSessionMemoryChars   int
+	MaxCrossMemoryChars     int
+	EnableToolBudget        bool
+	ToolBudget              agent.ToolBudget
+	Retry                   agent.RetryConfig
+	PromptCache             agent.PromptCacheConfig
+	Coordination            agent.CoordinationConfig
+	Hooks                   *agent.HookManager
+	LogPath                 string
 }
 
 func main() {
@@ -96,6 +100,10 @@ func main() {
 		MaxConsecutiveAPIErrors:  cfg.MaxAPIErrors,
 		MaxConcurrentSubAgents:   cfg.MaxSubAgents,
 		MaxSubAgentDepth:         cfg.MaxSubAgentDepth,
+		SessionMemoryThreshold:   cfg.SessionMemoryThreshold,
+		MaxSessionMemoryEntries:  cfg.MaxSessionMemoryEntries,
+		MaxSessionMemoryChars:    cfg.MaxSessionMemoryChars,
+		MaxCrossMemoryChars:      cfg.MaxCrossMemoryChars,
 		EnableToolBudget:         cfg.EnableToolBudget,
 		ToolBudget:               cfg.ToolBudget,
 		RetryConfig:              cfg.Retry,
@@ -219,6 +227,7 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 		if resp.StopReason != "" && resp.StopReason != "completed" {
 			fmt.Printf("%sstop: %s%s\n", colorGray, resp.StopReason, colorReset)
 		}
+		a.ScheduleCrossSessionMemoryExtraction(agent.WithTraceID(context.Background(), agent.NewTraceID()))
 		if err := session.save(); err != nil {
 			fmt.Fprintf(os.Stderr, "%ssave session: %v%s\n", colorRed, err, colorReset)
 		}
@@ -947,6 +956,7 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 	cfg.Context.CompactThreshold = intValue(values, "COMPACT_THRESHOLD", cfg.Context.CompactThreshold)
 	cfg.Context.KeepRecentRounds = intValue(values, "KEEP_RECENT_ROUNDS", cfg.Context.KeepRecentRounds)
 	cfg.Context.MaxAgentsMDBytes = intValue(values, "MAX_AGENTS_MD_BYTES", cfg.Context.MaxAgentsMDBytes)
+	cfg.Context.ProgressiveMemoryMaxChars = intValue(values, "PROGRESSIVE_MEMORY_MAX_CHARS", cfg.Context.ProgressiveMemoryMaxChars)
 
 	cfg.MaxLLMTurns = intValue(values, "MAX_LLM_TURNS", 20)
 	cfg.MaxToolCalls = intValue(values, "MAX_TOOL_CALLS", 50)
@@ -955,6 +965,10 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 	cfg.MaxAPIErrors = intValue(values, "MAX_CONSECUTIVE_API_ERRORS", 3)
 	cfg.MaxSubAgentDepth = intValue(values, "MAX_SUB_AGENT_DEPTH", 1)
 	cfg.MaxSubAgents = intValue(values, "MAX_CONCURRENT_SUB_AGENTS", 4)
+	cfg.SessionMemoryThreshold = intValue(values, "SESSION_MEMORY_TOOL_THRESHOLD", 10)
+	cfg.MaxSessionMemoryEntries = intValue(values, "SESSION_MEMORY_MAX_ENTRIES", 8)
+	cfg.MaxSessionMemoryChars = intValue(values, "SESSION_MEMORY_MAX_CHARS", 8000)
+	cfg.MaxCrossMemoryChars = intValue(values, "CROSS_SESSION_MEMORY_MAX_CHARS", 12000)
 	cfg.Coordination = agent.CoordinationConfig{
 		SharedTempDir:     values["WORKER_SHARED_TEMP_DIR"],
 		EnableGitWorktree: boolValue(values, "WORKER_GIT_WORKTREE", false),

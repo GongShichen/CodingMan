@@ -37,14 +37,23 @@ type TodoItem struct {
 	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
+type SessionMemoryEntry struct {
+	ID               string    `json:"id"`
+	Content          string    `json:"content"`
+	ToolCallCount    int       `json:"tool_call_count"`
+	FileHistoryCount int       `json:"file_history_count"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
 type SessionSnapshot struct {
-	SessionID   string             `json:"session_id"`
-	ProjectDir  string             `json:"project_dir"`
-	Messages    []Message          `json:"messages"`
-	FileHistory []FileHistoryEntry `json:"file_history"`
-	Attribution []AttributionEntry `json:"attribution"`
-	Todos       []TodoItem         `json:"todos"`
-	UpdatedAt   time.Time          `json:"updated_at"`
+	SessionID   string               `json:"session_id"`
+	ProjectDir  string               `json:"project_dir"`
+	Messages    []Message            `json:"messages"`
+	FileHistory []FileHistoryEntry   `json:"file_history"`
+	Attribution []AttributionEntry   `json:"attribution"`
+	Todos       []TodoItem           `json:"todos"`
+	Memory      []SessionMemoryEntry `json:"memory"`
+	UpdatedAt   time.Time            `json:"updated_at"`
 }
 
 type SessionRecord struct {
@@ -65,6 +74,8 @@ type SessionStore struct {
 	projectKey string
 	dir        string
 }
+
+const defaultSessionCheckpointRecords = 50
 
 func NewSessionStore(projectDir string) (*SessionStore, error) {
 	absProjectDir, err := filepath.Abs(projectDir)
@@ -133,11 +144,14 @@ func (store *SessionStore) AppendSnapshot(snapshot SessionSnapshot) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 	if _, err := file.Write(append(data, '\n')); err != nil {
+		_ = file.Close()
 		return err
 	}
-	return nil
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return compactSessionLogIfNeeded(path, defaultSessionCheckpointRecords)
 }
 
 func (store *SessionStore) Load(sessionID string) (SessionSnapshot, error) {
@@ -232,4 +246,51 @@ func loadSessionSnapshot(path string) (SessionSnapshot, error) {
 		return SessionSnapshot{}, errors.New("session has no state records")
 	}
 	return latest, nil
+}
+
+func compactSessionLogIfNeeded(path string, maxRecords int) error {
+	if maxRecords <= 0 {
+		return nil
+	}
+	count, err := countSessionRecords(path)
+	if err != nil {
+		return err
+	}
+	if count <= maxRecords {
+		return nil
+	}
+	snapshot, err := loadSessionSnapshot(path)
+	if err != nil {
+		return err
+	}
+	record := SessionRecord{
+		Type:      "session_state",
+		Timestamp: snapshot.UpdatedAt,
+		Snapshot:  snapshot,
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0600)
+}
+
+func countSessionRecords(path string) (int, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	count := 0
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024), 10*1024*1024)
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) != "" {
+			count++
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }

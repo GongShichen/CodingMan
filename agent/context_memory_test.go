@@ -46,6 +46,7 @@ func TestLoadProjectMemoryFrontmatterPathCondition(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(project, ".codingman", "rules", "match.md"), "---\npaths: src\n---\nmatched rule\n")
+	writeFile(t, filepath.Join(project, ".codingman", "rules", "array.md"), "---\npaths: [\"src\", \"cmd/**\"]\n---\narray matched rule\n")
 	writeFile(t, filepath.Join(project, ".codingman", "rules", "skip.md"), "---\npaths: docs\n---\nskipped rule\n")
 
 	content, err := agent.LoadProjectMemory(agent.ContextConfig{
@@ -60,6 +61,9 @@ func TestLoadProjectMemoryFrontmatterPathCondition(t *testing.T) {
 	}
 	if !strings.Contains(content, "matched rule") {
 		t.Fatalf("matching rule missing:\n%s", content)
+	}
+	if !strings.Contains(content, "array matched rule") {
+		t.Fatalf("quoted array rule missing:\n%s", content)
 	}
 	if strings.Contains(content, "skipped rule") {
 		t.Fatalf("non-matching rule loaded:\n%s", content)
@@ -78,18 +82,46 @@ func TestLoadProjectMemoryRejectsUnsafeSymlink(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(project, ".codingman", "AGENTS.md"), "@linked.md\n")
 
-	content, err := agent.LoadProjectMemory(agent.ContextConfig{
+	result := agent.LoadProjectMemoryWithWarnings(agent.ContextConfig{
 		Cwd:              project,
 		ProjectRoot:      project,
 		BaseSystem:       "base",
 		MaxAgentsMDBytes: 40000,
 		LoadAgentsMD:     true,
 	})
+	if len(result.Warnings) == 0 {
+		t.Fatalf("expected unsafe symlink warning")
+	}
+	if strings.Contains(result.Content, "secret") {
+		t.Fatalf("unsafe symlink include loaded:\n%s", result.Content)
+	}
+}
+
+func TestLoadProjectMemoryProgressiveIndex(t *testing.T) {
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, ".codingman", "AGENTS.md"), "root memory\n")
+	largeRulePath := filepath.Join(project, ".codingman", "rules", "large.md")
+	writeFile(t, largeRulePath, "large rule start\n"+strings.Repeat("x", 2000)+"\nvery-large-rule-tail\n")
+
+	content, err := agent.LoadProjectMemory(agent.ContextConfig{
+		Cwd:                       project,
+		ProjectRoot:               project,
+		BaseSystem:                "base",
+		MaxAgentsMDBytes:          40000,
+		ProgressiveMemoryMaxChars: 700,
+		LoadAgentsMD:              true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(content, "secret") {
-		t.Fatalf("unsafe symlink include loaded:\n%s", content)
+	if !strings.Contains(content, "root memory") {
+		t.Fatalf("core memory missing:\n%s", content)
+	}
+	if !strings.Contains(content, "渐进式加载索引") || !strings.Contains(content, largeRulePath) {
+		t.Fatalf("progressive index missing:\n%s", content)
+	}
+	if strings.Contains(content, "very-large-rule-tail") {
+		t.Fatalf("large rule was fully loaded instead of deferred:\n%s", content)
 	}
 }
 
