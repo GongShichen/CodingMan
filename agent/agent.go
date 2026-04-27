@@ -25,6 +25,9 @@ type Agent struct {
 	system                   string
 	model                    string
 	messages                 []Message
+	fileHistory              []FileHistoryEntry
+	attribution              []AttributionEntry
+	todos                    []TodoItem
 	turns                    int
 	maxTurn                  int
 	maxToolCalls             int
@@ -158,6 +161,9 @@ func NewAgent(config AgentConfig) *Agent {
 		system:                   system,
 		model:                    config.Model,
 		messages:                 make([]Message, 0),
+		fileHistory:              make([]FileHistoryEntry, 0),
+		attribution:              make([]AttributionEntry, 0),
+		todos:                    make([]TodoItem, 0),
 		maxTurn:                  defaultMaxTurnValue(config.MaxLLMTurns, config.MaxTurn),
 		maxToolCalls:             defaultPositiveInt(config.MaxToolCalls, defaultMaxToolCalls),
 		maxParallelToolCalls:     defaultPositiveInt(config.MaxParallelToolCalls, defaultMaxParallelToolCalls),
@@ -735,6 +741,40 @@ func (agent *Agent) Messages() []Message {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	return agent.snapshotMessagesLocked()
+}
+
+func (agent *Agent) Snapshot(sessionID string, projectDir string) SessionSnapshot {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return SessionSnapshot{
+		SessionID:   sessionID,
+		ProjectDir:  projectDir,
+		Messages:    agent.snapshotMessagesLocked(),
+		FileHistory: append([]FileHistoryEntry(nil), agent.fileHistory...),
+		Attribution: append([]AttributionEntry(nil), agent.attribution...),
+		Todos:       append([]TodoItem(nil), agent.todos...),
+		UpdatedAt:   time.Now().UTC(),
+	}
+}
+
+func (agent *Agent) Restore(snapshot SessionSnapshot) {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.messages = cloneMessages(snapshot.Messages)
+	agent.fileHistory = append([]FileHistoryEntry(nil), snapshot.FileHistory...)
+	agent.attribution = append([]AttributionEntry(nil), snapshot.Attribution...)
+	agent.todos = append([]TodoItem(nil), snapshot.Todos...)
+	agent.turns = countAssistantTurns(agent.messages)
+}
+
+func countAssistantTurns(messages []Message) int {
+	count := 0
+	for _, message := range messages {
+		if message.Role == "assistant" {
+			count++
+		}
+	}
+	return count
 }
 
 func (agent *Agent) Registry() *tool.Registry {
@@ -1315,6 +1355,7 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution, result *ToolResult) {
 	traceID := prepared.traceID
 	content, err := agent.callPreparedTool(prepared)
+	agent.recordToolFileActivity(prepared)
 	if err != nil {
 		agent.log(traceID, "tool_execute error name=%s id=%s output_chars=%d error=%v", prepared.name, prepared.toolUse.ID, len(content), err)
 		result.Content = formatToolErrorWithOutput(result.ToolUse, err, content)
@@ -1324,6 +1365,39 @@ func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution
 	result.Content = content
 	result.IsError = false
 	agent.log(traceID, "tool_execute success name=%s id=%s result_chars=%d", prepared.name, prepared.toolUse.ID, len(content))
+}
+
+func (agent *Agent) recordToolFileActivity(prepared preparedToolExecution) {
+	path, _ := stringFromMap(prepared.input, "path", "file_path", "filePath")
+	if path == "" {
+		return
+	}
+	action := ""
+	switch prepared.name {
+	case "read":
+		action = "read"
+	case "write":
+		action = "write"
+	case "edit":
+		action = "edit"
+	default:
+		return
+	}
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.fileHistory = append(agent.fileHistory, FileHistoryEntry{
+		Path:      path,
+		Action:    action,
+		AgentID:   agent.id,
+		Timestamp: time.Now().UTC(),
+	})
+	if action == "write" || action == "edit" {
+		agent.attribution = append(agent.attribution, AttributionEntry{
+			Path:    path,
+			AgentID: agent.id,
+			Note:    action,
+		})
+	}
 }
 
 func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, error) {

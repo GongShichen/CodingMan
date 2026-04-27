@@ -109,11 +109,16 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	tui := newTUIController(scanner)
+	session := newSessionController(a, cfg.Context.Cwd)
+	if err := session.save(); err != nil {
+		fmt.Fprintf(os.Stderr, "%ssave session: %v%s\n", colorRed, err, colorReset)
+	}
 	if permissions := a.Permission(); permissions != nil {
 		permissions.SetAskFunc(tui.permissionPrompt)
 	}
 
 	printHeader(cfg, source)
+	printSessionHeader(session)
 
 	for {
 		fmt.Printf("%s>%s ", colorCyan, colorReset)
@@ -134,6 +139,9 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 		}
 		if prompt == "/clear" {
 			a.Clear()
+			if err := session.save(); err != nil {
+				fmt.Fprintf(os.Stderr, "%ssave session: %v%s\n", colorRed, err, colorReset)
+			}
 			fmt.Println(colorDim + "conversation cleared" + colorReset)
 			continue
 		}
@@ -142,7 +150,7 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 			continue
 		}
 		if strings.HasPrefix(prompt, "/") {
-			if handled := handleSlashCommand(a, tui, prompt); handled {
+			if handled := handleSlashCommand(a, tui, session, prompt); handled {
 				continue
 			}
 			fmt.Printf("%sunknown command:%s %s\n", colorRed, colorReset, prompt)
@@ -171,6 +179,9 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 		if err != nil {
 			fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
 			if !interrupted {
+				if saveErr := session.save(); saveErr != nil {
+					fmt.Fprintf(os.Stderr, "%ssave session: %v%s\n", colorRed, saveErr, colorReset)
+				}
 				continue
 			}
 		}
@@ -192,6 +203,9 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 				resp, interrupted, err = tui.runAgent(a, followUp)
 				if err != nil {
 					fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+					if saveErr := session.save(); saveErr != nil {
+						fmt.Fprintf(os.Stderr, "%ssave session: %v%s\n", colorRed, saveErr, colorReset)
+					}
 					continue
 				}
 				if resp.Content != "" {
@@ -201,6 +215,9 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 		}
 		if resp.StopReason != "" && resp.StopReason != "completed" {
 			fmt.Printf("%sstop: %s%s\n", colorGray, resp.StopReason, colorReset)
+		}
+		if err := session.save(); err != nil {
+			fmt.Fprintf(os.Stderr, "%ssave session: %v%s\n", colorRed, err, colorReset)
 		}
 		fmt.Printf("%sinput=%d cached=%d cache_write=%d output=%d retry=%d elapsed=%s%s\n\n",
 			colorGray,
@@ -213,6 +230,68 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 			colorReset,
 		)
 	}
+}
+
+type sessionController struct {
+	agent     *agent.Agent
+	store     *agent.SessionStore
+	sessionID string
+}
+
+func newSessionController(a *agent.Agent, projectDir string) *sessionController {
+	store, err := agent.NewSessionStore(projectDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%ssession disabled: %v%s\n", colorRed, err, colorReset)
+		return &sessionController{agent: a, sessionID: agent.NewSessionID()}
+	}
+	return &sessionController{
+		agent:     a,
+		store:     store,
+		sessionID: agent.NewSessionID(),
+	}
+}
+
+func (session *sessionController) save() error {
+	if session == nil || session.store == nil || session.agent == nil {
+		return nil
+	}
+	return session.store.AppendSnapshot(session.agent.Snapshot(session.sessionID, session.store.ProjectDir()))
+}
+
+func (session *sessionController) resume(sessionID string) error {
+	if session == nil || session.store == nil || session.agent == nil {
+		return errors.New("session store is unavailable")
+	}
+	var snapshot agent.SessionSnapshot
+	var err error
+	if strings.TrimSpace(sessionID) == "" || sessionID == "latest" {
+		snapshot, err = session.store.LoadLatest()
+	} else {
+		snapshot, err = session.store.Load(sessionID)
+	}
+	if err != nil {
+		return err
+	}
+	session.agent.Restore(snapshot)
+	session.sessionID = snapshot.SessionID
+	return session.save()
+}
+
+func (session *sessionController) list() ([]agent.SessionInfo, error) {
+	if session == nil || session.store == nil {
+		return nil, errors.New("session store is unavailable")
+	}
+	return session.store.List()
+}
+
+func printSessionHeader(session *sessionController) {
+	if session == nil || session.store == nil {
+		return
+	}
+	fmt.Printf("%ssession:%s %s  %spath:%s %s\n\n",
+		colorGray, colorReset, session.sessionID,
+		colorGray, colorReset, session.store.Dir(),
+	)
 }
 
 func printHeader(cfg RuntimeConfig, source string) {
@@ -235,6 +314,8 @@ func printHelp() {
 	fmt.Println("  /plan                         show plan mode status")
 	fmt.Println("  /plan on                      plan before execution")
 	fmt.Println("  /plan off                     execute directly")
+	fmt.Println("  /sessions                     list saved sessions for this directory")
+	fmt.Println("  /resume [session_id|latest]   restore a saved session")
 	fmt.Println("  /system <path>                load system prompt from file")
 	fmt.Println("  /permission                   show permission mode and policy")
 	fmt.Println("  /permission ask               ask before tool calls")
@@ -248,13 +329,17 @@ func printHelp() {
 	fmt.Println()
 }
 
-func handleSlashCommand(a *agent.Agent, tui *tuiController, prompt string) bool {
+func handleSlashCommand(a *agent.Agent, tui *tuiController, session *sessionController, prompt string) bool {
 	fields := strings.Fields(prompt)
 	if len(fields) == 0 {
 		return false
 	}
 
 	switch fields[0] {
+	case "/sessions":
+		return handleSessionsCommand(session)
+	case "/resume":
+		return handleResumeCommand(session, fields)
 	case "/plan":
 		return handlePlanCommand(tui, fields)
 	case "/system":
@@ -336,6 +421,39 @@ func handlePlanCommand(tui *tuiController, fields []string) bool {
 		return true
 	}
 	printPlanStatus(tui.planMode)
+	return true
+}
+
+func handleSessionsCommand(session *sessionController) bool {
+	sessions, err := session.list()
+	if err != nil {
+		fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+		return true
+	}
+	if len(sessions) == 0 {
+		fmt.Println(colorDim + "no saved sessions for this directory" + colorReset)
+		return true
+	}
+	for _, info := range sessions {
+		fmt.Printf("%s%s%s  %supdated:%s %s  %smessages:%s %d\n",
+			colorBold, info.ID, colorReset,
+			colorGray, colorReset, info.UpdatedAt.Local().Format("2006-01-02 15:04:05"),
+			colorGray, colorReset, info.Messages,
+		)
+	}
+	return true
+}
+
+func handleResumeCommand(session *sessionController, fields []string) bool {
+	sessionID := "latest"
+	if len(fields) > 1 {
+		sessionID = fields[1]
+	}
+	if err := session.resume(sessionID); err != nil {
+		fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+		return true
+	}
+	fmt.Printf("%sresumed session:%s %s\n", colorGray, colorReset, session.sessionID)
 	return true
 }
 
