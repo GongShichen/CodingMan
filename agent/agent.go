@@ -31,6 +31,7 @@ type Agent struct {
 	sessionMemory             []SessionMemoryEntry
 	toolCallsSinceMemory      int
 	toolCallsSinceSkillReview int
+	skillEvolutionRunning     bool
 	sessionMemoryThreshold    int
 	skillEvolutionThreshold   int
 	maxSessionMemoryEntries   int
@@ -38,6 +39,7 @@ type Agent struct {
 	crossMemoryStore          *CrossSessionMemoryStore
 	maxCrossMemoryChars       int
 	crossMemoryJobs           chan string
+	skillEvolutionJobs        chan string
 	turns                     int
 	maxTurn                   int
 	maxToolCalls              int
@@ -166,6 +168,7 @@ func NewAgent(config AgentConfig) *Agent {
 	maxCrossMemoryChars := defaultPositiveInt(config.MaxCrossMemoryChars, defaultMaxCrossMemoryChars)
 	var crossMemoryStore *CrossSessionMemoryStore
 	var crossMemoryJobs chan string
+	skillEvolutionJobs := make(chan string, 1)
 	if defaultBool(config.EnableCrossSessionMemory, true) {
 		if store, err := NewCrossSessionMemoryStore(contextConfig.ProjectRoot); err == nil {
 			crossMemoryStore = store
@@ -223,6 +226,7 @@ func NewAgent(config AgentConfig) *Agent {
 		crossMemoryStore:         crossMemoryStore,
 		maxCrossMemoryChars:      maxCrossMemoryChars,
 		crossMemoryJobs:          crossMemoryJobs,
+		skillEvolutionJobs:       skillEvolutionJobs,
 		maxTurn:                  defaultMaxTurnValue(config.MaxLLMTurns, config.MaxTurn),
 		maxToolCalls:             defaultPositiveInt(config.MaxToolCalls, defaultMaxToolCalls),
 		maxParallelToolCalls:     defaultPositiveInt(config.MaxParallelToolCalls, defaultMaxParallelToolCalls),
@@ -257,6 +261,7 @@ func NewAgent(config AgentConfig) *Agent {
 	agent.coordinator = NewCoordinator(agent, config.Coordination)
 	agent.registerInternalTools()
 	agent.startCrossSessionMemoryWorker()
+	agent.startSkillEvolutionWorker()
 
 	return agent
 }
@@ -588,12 +593,7 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 
 		toolCalls += len(toolUses)
 		agent.appendToolResultMessages(results)
-		if agent.MaybeUpdateSessionMemory(ctx) {
-			agent.log(traceID, "session_memory updated total=%d", len(agent.SessionMemory()))
-		}
-		if agent.MaybeEvolveSkills(ctx) {
-			agent.log(traceID, "skill_evolution completed")
-		}
+		agent.afterToolExecutions(ctx)
 		agent.log(traceID, "tool_loop tool_results count=%d total_tool_calls=%d", len(results), toolCalls)
 		for _, result := range results {
 			agent.log(traceID, "tool result id=%s name=%s error=%v:\n%s", result.ToolUse.ID, result.ToolUse.Name, result.IsError, result.Content)
@@ -832,6 +832,21 @@ func (agent *Agent) ClearActiveSkill() {
 	agent.skillToolRestriction = false
 }
 
+func (agent *Agent) refreshActiveSkillLocked() {
+	agent.skillAllowedTools = nil
+	agent.skillToolRestriction = false
+	if agent.activeSkill == "" {
+		return
+	}
+	for _, skill := range agent.skills {
+		if skill.Name == agent.activeSkill {
+			agent.skillAllowedTools, agent.skillToolRestriction = skillToolAllowlist(skill)
+			return
+		}
+	}
+	agent.activeSkill = ""
+}
+
 func (agent *Agent) SetBaseSystemPrompt(baseSystem string) error {
 	if strings.TrimSpace(baseSystem) == "" {
 		return errors.New("system prompt must not be empty")
@@ -862,20 +877,7 @@ func (agent *Agent) SetBaseSystemPrompt(baseSystem string) error {
 	agent.contextConfig = normalizeContextConfig(contextConfig)
 	agent.system = system
 	agent.skills = loadedSkillsForConfig(agent.contextConfig)
-	if agent.activeSkill == "" {
-		agent.skillAllowedTools = nil
-		agent.skillToolRestriction = false
-		return nil
-	}
-	for _, skill := range agent.skills {
-		if skill.Name == agent.activeSkill {
-			agent.skillAllowedTools, agent.skillToolRestriction = skillToolAllowlist(skill)
-			return nil
-		}
-	}
-	agent.activeSkill = ""
-	agent.skillAllowedTools = nil
-	agent.skillToolRestriction = false
+	agent.refreshActiveSkillLocked()
 	return nil
 }
 
@@ -1369,12 +1371,10 @@ func (agent *Agent) ExecuteTool(ctx context.Context, toolUse map[string]any) (st
 	if result.IsError {
 		err := errors.New(result.Content)
 		agent.log(traceID, "execute_tool name=%s error=%v", prepared.name, err)
-		agent.MaybeUpdateSessionMemory(prepared.ctx)
-		agent.MaybeEvolveSkills(prepared.ctx)
+		agent.afterToolExecutions(prepared.ctx)
 		return result.Content, err
 	}
-	agent.MaybeUpdateSessionMemory(prepared.ctx)
-	agent.MaybeEvolveSkills(prepared.ctx)
+	agent.afterToolExecutions(prepared.ctx)
 	agent.log(traceID, "execute_tool name=%s result_chars=%d", prepared.name, len(result.Content))
 	return result.Content, nil
 }
@@ -1409,8 +1409,19 @@ func (agent *Agent) ExecuteTools(ctx context.Context, toolUses []ToolUse, maxPar
 		}
 		agent.executePreparedToolIntoResult(preparedTools[batch.start], &results[batch.start])
 	}
+	agent.afterToolExecutions(ctx)
 	agent.log(traceID, "execute_tools completed count=%d", len(results))
 	return results
+}
+
+func (agent *Agent) afterToolExecutions(ctx context.Context) {
+	traceID := TraceIDFromContext(ctx)
+	if agent.MaybeUpdateSessionMemory(ctx) {
+		agent.log(traceID, "session_memory updated total=%d", len(agent.SessionMemory()))
+	}
+	if agent.MaybeEvolveSkills(ctx) {
+		agent.log(traceID, "skill_evolution scheduled")
+	}
 }
 
 func (agent *Agent) runStreamingToolTurn(ctx context.Context, llm LLM, messages []Message, opts ChatOptions, maxParallel int, maxToolCalls int, recovery StreamRecoveryConfig) (LLMResponse, []ToolResult, error) {

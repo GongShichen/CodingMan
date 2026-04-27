@@ -10,8 +10,6 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
-
-	tool "github.com/GongShichen/CodingMan/tool"
 )
 
 type SkillEvolutionItem struct {
@@ -23,10 +21,69 @@ type SkillEvolutionItem struct {
 
 func (agent *Agent) MaybeEvolveSkills(ctxs ...context.Context) bool {
 	agent.mu.Lock()
-	if agent.skillEvolutionThreshold <= 0 || agent.toolCallsSinceSkillReview < agent.skillEvolutionThreshold {
+	if agent.skillEvolutionThreshold <= 0 || agent.toolCallsSinceSkillReview < agent.skillEvolutionThreshold || agent.skillEvolutionRunning {
 		agent.mu.Unlock()
 		return false
 	}
+	jobs := agent.skillEvolutionJobs
+	agent.skillEvolutionRunning = true
+	agent.mu.Unlock()
+
+	ctx := context.Background()
+	if len(ctxs) > 0 && ctxs[0] != nil {
+		ctx = ctxs[0]
+	}
+	_, traceID := ensureTrace(ctx)
+	if jobs == nil {
+		agent.finishSkillEvolution(false, traceID, "skill_evolution schedule_skipped reason=jobs_nil")
+		return false
+	}
+	select {
+	case jobs <- traceID:
+		agent.log(traceID, "skill_evolution scheduled")
+		return true
+	default:
+		agent.finishSkillEvolution(false, traceID, "skill_evolution schedule_skipped reason=busy")
+		return false
+	}
+}
+
+func (agent *Agent) startSkillEvolutionWorker() {
+	agent.mu.Lock()
+	jobs := agent.skillEvolutionJobs
+	agent.mu.Unlock()
+	if jobs == nil {
+		return
+	}
+	go func() {
+		for traceID := range jobs {
+			ctx := WithTraceID(context.Background(), traceID)
+			if err := agent.runSkillEvolution(ctx); err != nil {
+				agent.finishSkillEvolution(false, traceID, "skill_evolution worker_error=%v", err)
+				continue
+			}
+			agent.finishSkillEvolution(true, traceID, "skill_evolution completed")
+		}
+	}()
+}
+
+func (agent *Agent) finishSkillEvolution(success bool, traceID string, format string, args ...any) {
+	if format != "" {
+		agent.log(traceID, format, args...)
+	}
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if success {
+		agent.toolCallsSinceSkillReview = 0
+		agent.skills = loadedSkillsForConfig(agent.contextConfig)
+		agent.refreshActiveSkillLocked()
+	}
+	agent.skillEvolutionRunning = false
+}
+
+func (agent *Agent) runSkillEvolution(ctx context.Context) error {
+	traceID := TraceIDFromContext(ctx)
+	agent.mu.Lock()
 	toolCallCount := agent.toolCallsSinceSkillReview
 	messages := agent.snapshotMessagesLocked()
 	fileHistory := append([]FileHistoryEntry(nil), agent.fileHistory...)
@@ -36,46 +93,26 @@ func (agent *Agent) MaybeEvolveSkills(ctxs ...context.Context) bool {
 	model := agent.model
 	promptCache := agent.promptCache
 	contextConfig := agent.contextConfig
+	registry := agent.registry
 	agent.mu.Unlock()
 
-	ctx := context.Background()
-	if len(ctxs) > 0 && ctxs[0] != nil {
-		ctx = ctxs[0]
-	}
-	ctx, traceID := ensureTrace(ctx)
 	if llm == nil {
-		agent.log(traceID, "skill_evolution skipped reason=llm_nil")
-		return false
+		return errors.New("llm is nil")
+	}
+	if registry == nil {
+		return errors.New("tool registry is nil")
 	}
 
 	agent.log(traceID, "skill_evolution review start tool_calls=%d messages=%d", toolCallCount, len(messages))
 	items, err := agent.reviewSkillsForEvolution(ctx, llm, model, promptCache, contextConfig, messages, fileHistory, attribution, todos)
 	if err != nil {
-		agent.log(traceID, "skill_evolution review_error=%v", err)
-		return false
+		return fmt.Errorf("review: %w", err)
 	}
 	if err := agent.saveSkillEvolutionItems(ctx, items); err != nil {
-		agent.log(traceID, "skill_evolution save_error=%v", err)
-		return false
+		return fmt.Errorf("save: %w", err)
 	}
-
-	agent.mu.Lock()
-	agent.toolCallsSinceSkillReview = 0
-	agent.skills = loadedSkillsForConfig(agent.contextConfig)
-	if agent.activeSkill != "" {
-		agent.skillAllowedTools = nil
-		agent.skillToolRestriction = false
-		for _, skill := range agent.skills {
-			if skill.Name == agent.activeSkill {
-				agent.skillAllowedTools, agent.skillToolRestriction = skillToolAllowlist(skill)
-				break
-			}
-		}
-	}
-	agent.mu.Unlock()
-
 	agent.log(traceID, "skill_evolution review completed items=%d", len(items))
-	return true
+	return nil
 }
 
 func (agent *Agent) reviewSkillsForEvolution(ctx context.Context, llm LLM, model string, promptCache PromptCacheConfig, config ContextConfig, messages []Message, fileHistory []FileHistoryEntry, attribution []AttributionEntry, todos []TodoItem) ([]SkillEvolutionItem, error) {
@@ -129,7 +166,7 @@ func buildSkillEvolutionPrompt(config ContextConfig, messages []Message, fileHis
 }
 
 func parseSkillEvolutionItems(content string) ([]SkillEvolutionItem, error) {
-	content = strings.TrimSpace(stripJSONFence(content))
+	content = strings.TrimSpace(extractJSONArray(content))
 	if content == "" {
 		return nil, errors.New("empty skill evolution response")
 	}
@@ -181,18 +218,29 @@ func (agent *Agent) saveSkillEvolutionItems(ctx context.Context, items []SkillEv
 			continue
 		}
 		path := filepath.Join(base, name, "SKILL.md")
+		if err := ensureUserSkillPathSafe(base, path); err != nil {
+			return fmt.Errorf("%s: %w", item.Name, err)
+		}
 		content := ensureSkillDocument(item, name)
-		if err := saveSkillDocumentWithTools(ctx, path, content, item.Action); err != nil {
+		if err := agent.saveSkillDocumentWithTools(ctx, path, content, item.Action); err != nil {
 			return fmt.Errorf("%s: %w", item.Name, err)
 		}
 	}
 	return nil
 }
 
-func saveSkillDocumentWithTools(ctx context.Context, path string, content string, action string) error {
-	_ = ctx
+func (agent *Agent) saveSkillDocumentWithTools(ctx context.Context, path string, content string, action string) error {
+	traceID := TraceIDFromContext(ctx)
+	agent.mu.Lock()
+	registry := agent.registry
+	agent.mu.Unlock()
+	if registry == nil {
+		return errors.New("tool registry is nil")
+	}
+
 	if action == "create" {
-		_, err := tool.NewWriteTool().Call(map[string]any{
+		agent.log(traceID, "skill_evolution write action=create path=%s", path)
+		_, err := registry.CallContext(ctx, "write", map[string]any{
 			"filePath":  path,
 			"content":   content,
 			"overwrite": false,
@@ -207,7 +255,8 @@ func saveSkillDocumentWithTools(ctx context.Context, path string, content string
 
 	oldContent, err := os.ReadFile(path)
 	if err == nil {
-		_, editErr := tool.NewEditTool().Call(map[string]any{
+		agent.log(traceID, "skill_evolution write action=update path=%s", path)
+		_, editErr := registry.CallContext(ctx, "edit", map[string]any{
 			"filePath": path,
 			"oldText":  string(oldContent),
 			"newText":  content,
@@ -217,12 +266,32 @@ func saveSkillDocumentWithTools(ctx context.Context, path string, content string
 	if !os.IsNotExist(err) {
 		return err
 	}
-	_, err = tool.NewWriteTool().Call(map[string]any{
+	agent.log(traceID, "skill_evolution write action=create_missing path=%s", path)
+	_, err = registry.CallContext(ctx, "write", map[string]any{
 		"filePath":  path,
 		"content":   content,
 		"overwrite": false,
 	})
 	return err
+}
+
+func ensureUserSkillPathSafe(base string, path string) error {
+	absBase := cleanAbs(base)
+	absPath := cleanAbs(path)
+	if !isWithinDir(absBase, absPath) {
+		return fmt.Errorf("skill path escapes user skill directory: %s", path)
+	}
+	dir := filepath.Dir(absPath)
+	if resolvedDir, err := filepath.EvalSymlinks(dir); err == nil {
+		resolvedBase := absBase
+		if realBase, baseErr := filepath.EvalSymlinks(absBase); baseErr == nil {
+			resolvedBase = cleanAbs(realBase)
+		}
+		if !isWithinDir(resolvedBase, cleanAbs(resolvedDir)) {
+			return fmt.Errorf("skill path resolves outside user skill directory: %s", path)
+		}
+	}
+	return nil
 }
 
 func ensureSkillDocument(item SkillEvolutionItem, safeName string) string {

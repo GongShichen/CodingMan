@@ -43,6 +43,10 @@ func NewBashTool() *BashTool {
 }
 
 func (b *BashTool) Call(input map[string]any) (string, error) {
+	return b.CallContext(context.Background(), input)
+}
+
+func (b *BashTool) CallContext(ctx context.Context, input map[string]any) (string, error) {
 	command, ok := input["command"].(string)
 	if !ok || command == "" {
 		return "", errors.New("command is required")
@@ -51,7 +55,7 @@ func (b *BashTool) Call(input map[string]any) (string, error) {
 	timeout := parseTimeoutMs(input["timeout"])
 	cwd, _ := input["cwd"].(string)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Millisecond)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)

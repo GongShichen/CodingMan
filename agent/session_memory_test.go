@@ -19,6 +19,12 @@ func TestSessionMemoryUpdatesAfterToolCallThreshold(t *testing.T) {
 	if err := registry.Register(echoTool{}); err != nil {
 		t.Fatal(err)
 	}
+	if err := registry.Register(tool.NewWriteTool()); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(tool.NewEditTool()); err != nil {
+		t.Fatal(err)
+	}
 	a := agent.NewAgent(agent.AgentConfig{
 		LLM:                    &fakeLLM{},
 		Registry:               registry,
@@ -269,6 +275,12 @@ func TestSkillEvolutionCreatesUserSkillAfterThreshold(t *testing.T) {
 	if err := registry.Register(echoTool{}); err != nil {
 		t.Fatal(err)
 	}
+	if err := registry.Register(tool.NewWriteTool()); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(tool.NewEditTool()); err != nil {
+		t.Fatal(err)
+	}
 	a := agent.NewAgent(agent.AgentConfig{
 		LLM:                     llm,
 		Registry:                registry,
@@ -287,10 +299,17 @@ func TestSkillEvolutionCreatesUserSkillAfterThreshold(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	waitForCondition(t, func() bool { return reviewCalls.Load() == 1 })
 	if reviewCalls.Load() != 1 {
 		t.Fatalf("expected one skill review, got %d", reviewCalls.Load())
 	}
 	path := filepath.Join(home, ".codingman", "skills", "go-test-fixes", "SKILL.md")
+	var data []byte
+	waitForCondition(t, func() bool {
+		var err error
+		data, err = os.ReadFile(path)
+		return err == nil && strings.Contains(string(data), "Run focused tests")
+	})
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -318,6 +337,12 @@ func TestSkillEvolutionEmptyReviewResetsCounter(t *testing.T) {
 	if err := registry.Register(echoTool{}); err != nil {
 		t.Fatal(err)
 	}
+	if err := registry.Register(tool.NewWriteTool()); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(tool.NewEditTool()); err != nil {
+		t.Fatal(err)
+	}
 	a := agent.NewAgent(agent.AgentConfig{
 		LLM:                     llm,
 		Registry:                registry,
@@ -336,7 +361,67 @@ func TestSkillEvolutionEmptyReviewResetsCounter(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	waitForCondition(t, func() bool { return reviewCalls.Load() == 1 })
 	if reviewCalls.Load() != 1 {
 		t.Fatalf("expected one review after counter reset, got %d", reviewCalls.Load())
 	}
+}
+
+func TestSkillEvolutionParsesNoisyJSONAndExecuteToolsTriggersReview(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var reviewCalls atomic.Int64
+	llm := &fakeLLM{
+		chatFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {
+			reviewCalls.Add(1)
+			return agent.LLMResponse{Content: "Here is the update:\n```json\n[{\"action\":\"create\",\"name\":\"Noisy JSON Skill\",\"description\":\"Parse fenced JSON output.\",\"content\":\"---\\nname: noisy-json-skill\\ndescription: Parse fenced JSON output.\\nallow_tools: [read]\\ncontext: fork\\n---\\n\\n# Noisy JSON Skill\\n\\nKeep only the JSON array from noisy model output.\\n\"}]\n```", StopReason: "completed"}, nil
+		},
+	}
+	registry := tool.NewRegistry()
+	if err := registry.Register(echoTool{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(tool.NewWriteTool()); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(tool.NewEditTool()); err != nil {
+		t.Fatal(err)
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM:                     llm,
+		Registry:                registry,
+		SessionMemoryThreshold:  100,
+		SkillEvolutionThreshold: 2,
+		Permission: agent.PermissionConfig{
+			Mode:         agent.PermissionModeAllowDeny,
+			AllowedTools: []string{"echo"},
+		},
+	})
+	results := a.ExecuteTools(context.Background(), []agent.ToolUse{
+		{ID: "one", Name: "echo", Input: `{"value":"one"}`},
+		{ID: "two", Name: "echo", Input: `{"value":"two"}`},
+	}, 2)
+	if len(results) != 2 || results[0].IsError || results[1].IsError {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+	path := filepath.Join(home, ".codingman", "skills", "noisy-json-skill", "SKILL.md")
+	waitForCondition(t, func() bool {
+		data, err := os.ReadFile(path)
+		return err == nil && strings.Contains(string(data), "Keep only the JSON array")
+	})
+	if reviewCalls.Load() != 1 {
+		t.Fatalf("expected one review, got %d", reviewCalls.Load())
+	}
+}
+
+func waitForCondition(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before deadline")
 }
