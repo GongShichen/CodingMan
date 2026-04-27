@@ -1,11 +1,18 @@
 package tool
 
+import "context"
+
 type Tool interface {
 	Name() string
 	Description() string
 	InputSchema() map[string]any
 	Call(input map[string]any) (string, error)
 	ToAPIFormat() map[string]any
+}
+
+type ContextTool interface {
+	Tool
+	CallContext(ctx context.Context, input map[string]any) (string, error)
 }
 
 type ToolSchema struct {

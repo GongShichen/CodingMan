@@ -57,11 +57,13 @@ type ContextConfig struct {
 	BaseSystem                string
 	IncludeDate               bool
 	LoadAgentsMD              bool
+	LoadSkills                bool
 	AutoCompact               bool
 	CompactThreshold          int
 	KeepRecentRounds          int
 	MaxAgentsMDBytes          int
 	ProgressiveMemoryMaxChars int
+	ProgressiveSkillMaxChars  int
 }
 
 func DefaultContextConfig() ContextConfig {
@@ -70,11 +72,13 @@ func DefaultContextConfig() ContextConfig {
 		BaseSystem:                DefaultCodingSystemPrompt + "\n\n" + CoordinatorSystemPrompt,
 		IncludeDate:               true,
 		LoadAgentsMD:              true,
+		LoadSkills:                true,
 		AutoCompact:               true,
 		CompactThreshold:          defaultAutoCompactSizeThreshold,
 		KeepRecentRounds:          defaultAutoCompactRecentRounds,
 		MaxAgentsMDBytes:          defaultAgentsMDMaxBytes,
 		ProgressiveMemoryMaxChars: defaultProgressiveMemoryMaxChars,
+		ProgressiveSkillMaxChars:  defaultProgressiveSkillMaxChars,
 	}
 }
 
@@ -104,70 +108,10 @@ func normalizeContextConfig(config ContextConfig) ContextConfig {
 	if config.ProgressiveMemoryMaxChars > config.MaxAgentsMDBytes {
 		config.ProgressiveMemoryMaxChars = config.MaxAgentsMDBytes
 	}
+	if config.ProgressiveSkillMaxChars <= 0 {
+		config.ProgressiveSkillMaxChars = defaults.ProgressiveSkillMaxChars
+	}
 	return config
-}
-
-// Deprecated: use LoadProjectMemory or LoadProjectMemoryWithWarnings.
-func FindAgentsMD(startDir string) (string, error) {
-	/*
-		从指定目录向上递归查找AGENTS.md文件，
-		查找顺序： startDir -> parent ->grandparent -> ... -> root
-	*/
-	if startDir == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return "", err
-		}
-		startDir = cwd
-	}
-
-	current, err := filepath.Abs(startDir)
-	if err != nil {
-		return "", err
-	}
-
-	info, err := os.Stat(current)
-	if err != nil {
-		return "", err
-	}
-	if !info.IsDir() {
-		current = filepath.Dir(current)
-	}
-
-	for {
-		candidate := filepath.Join(current, "AGENTS.md")
-		info, err := os.Stat(candidate)
-		if err == nil {
-			if info.IsDir() {
-				return "", fmt.Errorf("%s is a directory", candidate)
-			}
-			return candidate, nil
-		}
-		if !os.IsNotExist(err) {
-			return "", err
-		}
-
-		parent := filepath.Dir(current)
-		if parent == current {
-			return "", fmt.Errorf("%w: AGENTS.md", os.ErrNotExist)
-		}
-		current = parent
-	}
-}
-
-// Deprecated: use LoadProjectMemory or LoadProjectMemoryWithWarnings.
-func LoadAgentsMD(startDir string) (string, error) {
-	filePath, err := FindAgentsMD(startDir)
-	if err != nil {
-		return "", err
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", err
-	}
-
-	return string(content), nil
 }
 
 func BuildSystemPromptWithConfig(config ContextConfig) (string, error) {
@@ -194,6 +138,17 @@ func BuildSystemPromptWithConfig(config ContextConfig) (string, error) {
 		if len(memoryResult.Warnings) > 0 {
 			parts = append(parts, "## 项目记忆加载警告\n")
 			parts = append(parts, strings.Join(memoryResult.Warnings, "\n"))
+		}
+	}
+	if config.LoadSkills {
+		skillResult := LoadSkillsWithWarnings(config)
+		if skillResult.Content != "" {
+			parts = append(parts, "## Skills\n")
+			parts = append(parts, skillResult.Content)
+		}
+		if len(skillResult.Warnings) > 0 {
+			parts = append(parts, "## Skill 加载警告\n")
+			parts = append(parts, strings.Join(skillResult.Warnings, "\n"))
 		}
 	}
 
@@ -286,7 +241,39 @@ func LoadProjectMemoryWithWarnings(config ContextConfig) ProjectMemoryResult {
 	if len(deferredFiles) > 0 {
 		parts = append(parts, progressiveMemoryIndex(uniqueStrings(deferredFiles)))
 	}
-	return ProjectMemoryResult{Content: strings.Join(parts, "\n\n"), Warnings: append([]string(nil), ctx.warnings...)}
+	return ProjectMemoryResult{Content: joinPartsWithinBudget(parts, ctx.maxChars), Warnings: append([]string(nil), ctx.warnings...)}
+}
+
+func joinPartsWithinBudget(parts []string, maxChars int) string {
+	content := strings.Join(parts, "\n\n")
+	if maxChars <= 0 {
+		return content
+	}
+	runes := []rune(content)
+	if len(runes) <= maxChars {
+		return content
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	index := parts[len(parts)-1]
+	indexRunes := []rune(index)
+	if len(indexRunes) >= maxChars {
+		return string(indexRunes[:maxChars])
+	}
+	prefixBudget := maxChars - len(indexRunes) - len([]rune("\n\n"))
+	if prefixBudget < 0 {
+		prefixBudget = 0
+	}
+	prefix := strings.Join(parts[:len(parts)-1], "\n\n")
+	prefixRunes := []rune(prefix)
+	if len(prefixRunes) > prefixBudget {
+		prefix = string(prefixRunes[:prefixBudget])
+	}
+	if strings.TrimSpace(prefix) == "" {
+		return index
+	}
+	return strings.TrimSpace(prefix) + "\n\n" + index
 }
 
 func progressiveMemoryIndex(files []string) string {
@@ -625,24 +612,4 @@ func compactStrings(values []string) []string {
 		}
 	}
 	return result
-}
-
-// Deprecated: use LoadProjectMemory or LoadProjectMemoryWithWarnings.
-func loadAgentsMDWithLimit(startDir string, maxBytes int) (string, error) {
-	filePath, err := FindAgentsMD(startDir)
-	if err != nil {
-		return "", err
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", err
-	}
-
-	if maxBytes > 0 && len(content) > maxBytes {
-		content = content[:maxBytes]
-		return string(content) + "\n\n[AGENTS.md truncated]\n", nil
-	}
-
-	return string(content), nil
 }

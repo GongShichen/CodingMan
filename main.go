@@ -57,6 +57,7 @@ type RuntimeConfig struct {
 	PromptCache             agent.PromptCacheConfig
 	Coordination            agent.CoordinationConfig
 	Hooks                   *agent.HookManager
+	MCP                     agent.MCPConfig
 	LogPath                 string
 }
 
@@ -110,8 +111,10 @@ func main() {
 		PromptCache:              cfg.PromptCache,
 		Coordination:             cfg.Coordination,
 		Hooks:                    cfg.Hooks,
+		MCP:                      cfg.MCP,
 		Logger:                   logger,
 	})
+	defer a.Close()
 
 	RunTUI(a, cfg, source)
 }
@@ -326,6 +329,9 @@ func printHelp() {
 	fmt.Println("  /plan                         show plan mode status")
 	fmt.Println("  /plan on                      plan before execution")
 	fmt.Println("  /plan off                     execute directly")
+	fmt.Println("  /skill                        show loaded and active skills")
+	fmt.Println("  /skill use <name>             activate a skill and its allow_tools")
+	fmt.Println("  /skill clear                  clear active skill")
 	fmt.Println("  /sessions                     list saved sessions for this directory")
 	fmt.Println("  /resume [session_id|latest]   restore a saved session")
 	fmt.Println("  /system <path>                load system prompt from file")
@@ -356,6 +362,8 @@ func handleSlashCommand(a *agent.Agent, tui *tuiController, session *sessionCont
 		return handlePlanCommand(tui, fields)
 	case "/system":
 		return handleSystemCommand(a, fields)
+	case "/skill":
+		return handleSkillCommand(a, fields)
 	case "/permission":
 		permissions := a.Permission()
 		if permissions == nil {
@@ -411,6 +419,58 @@ func handleSlashCommand(a *agent.Agent, tui *tuiController, session *sessionCont
 		return true
 	default:
 		return false
+	}
+}
+
+func handleSkillCommand(a *agent.Agent, fields []string) bool {
+	if len(fields) == 1 || strings.EqualFold(fields[1], "list") {
+		printSkillStatus(a)
+		return true
+	}
+	switch strings.ToLower(fields[1]) {
+	case "use":
+		if len(fields) != 3 {
+			fmt.Println(colorRed + "usage: /skill use <name>" + colorReset)
+			return true
+		}
+		if err := a.SetActiveSkill(fields[2]); err != nil {
+			fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+			return true
+		}
+		fmt.Printf("%sactive skill:%s %s\n", colorGray, colorReset, fields[2])
+		return true
+	case "clear", "off":
+		a.ClearActiveSkill()
+		fmt.Println(colorGray + "active skill cleared" + colorReset)
+		return true
+	default:
+		fmt.Println(colorRed + "usage: /skill [list|use <name>|clear]" + colorReset)
+		return true
+	}
+}
+
+func printSkillStatus(a *agent.Agent) {
+	skills := a.Skills()
+	active, hasActive := a.ActiveSkill()
+	if len(skills) == 0 {
+		fmt.Println(colorDim + "no skills loaded" + colorReset)
+		return
+	}
+	for _, skill := range skills {
+		marker := " "
+		if hasActive && skill.Name == active.Name {
+			marker = "*"
+		}
+		allowTools := "all"
+		if len(skill.AllowTools) > 0 {
+			allowTools = strings.Join(skill.AllowTools, ",")
+		}
+		fmt.Printf("%s %s  %scontext:%s %s  %sallow:%s %s\n",
+			marker,
+			skill.Name,
+			colorGray, colorReset, skill.Context,
+			colorGray, colorReset, allowTools,
+		)
 	}
 }
 
@@ -952,11 +1012,13 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 	cfg.Context.BaseSystem = values["BASE_SYSTEM"]
 	cfg.Context.IncludeDate = boolValue(values, "INCLUDE_DATE", cfg.Context.IncludeDate)
 	cfg.Context.LoadAgentsMD = boolValue(values, "LOAD_AGENTS_MD", cfg.Context.LoadAgentsMD)
+	cfg.Context.LoadSkills = boolValue(values, "LOAD_SKILLS", cfg.Context.LoadSkills)
 	cfg.Context.AutoCompact = boolValue(values, "AUTO_COMPACT", cfg.Context.AutoCompact)
 	cfg.Context.CompactThreshold = intValue(values, "COMPACT_THRESHOLD", cfg.Context.CompactThreshold)
 	cfg.Context.KeepRecentRounds = intValue(values, "KEEP_RECENT_ROUNDS", cfg.Context.KeepRecentRounds)
 	cfg.Context.MaxAgentsMDBytes = intValue(values, "MAX_AGENTS_MD_BYTES", cfg.Context.MaxAgentsMDBytes)
 	cfg.Context.ProgressiveMemoryMaxChars = intValue(values, "PROGRESSIVE_MEMORY_MAX_CHARS", cfg.Context.ProgressiveMemoryMaxChars)
+	cfg.Context.ProgressiveSkillMaxChars = intValue(values, "PROGRESSIVE_SKILL_MAX_CHARS", cfg.Context.ProgressiveSkillMaxChars)
 
 	cfg.MaxLLMTurns = intValue(values, "MAX_LLM_TURNS", 20)
 	cfg.MaxToolCalls = intValue(values, "MAX_TOOL_CALLS", 50)
@@ -979,6 +1041,11 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 		return RuntimeConfig{}, "", err
 	}
 	cfg.Hooks = hooks
+	mcp, err := loadMCPConfig(projectRoot)
+	if err != nil {
+		return RuntimeConfig{}, "", err
+	}
+	cfg.MCP = mcp
 
 	cfg.EnableToolBudget = boolValue(values, "ENABLE_TOOL_BUDGET", true)
 	cfg.ToolBudget = agent.ToolBudget{
@@ -1023,6 +1090,62 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 		return fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+func loadMCPConfig(projectRoot string) (agent.MCPConfig, error) {
+	var merged agent.MCPConfig
+	paths := []string{}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".codingman", "settings.json"))
+	}
+	paths = append(paths, filepath.Join(projectRoot, "settings.json"))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return agent.MCPConfig{}, err
+		}
+		servers, err := parseMCPServers(data)
+		if err != nil {
+			return agent.MCPConfig{}, fmt.Errorf("%s: %w", path, err)
+		}
+		merged.Servers = append(merged.Servers, servers...)
+	}
+	return merged, nil
+}
+
+func parseMCPServers(data []byte) ([]agent.MCPServerConfig, error) {
+	var raw struct {
+		MCPServers      json.RawMessage `json:"mcp_servers"`
+		CamelMCPServers json.RawMessage `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	payload := raw.MCPServers
+	if len(payload) == 0 {
+		payload = raw.CamelMCPServers
+	}
+	if len(payload) == 0 || string(payload) == "null" {
+		return nil, nil
+	}
+	var list []agent.MCPServerConfig
+	if err := json.Unmarshal(payload, &list); err == nil {
+		return list, nil
+	}
+	var byName map[string]agent.MCPServerConfig
+	if err := json.Unmarshal(payload, &byName); err != nil {
+		return nil, err
+	}
+	for name, server := range byName {
+		if server.Name == "" {
+			server.Name = name
+		}
+		list = append(list, server)
+	}
+	return list, nil
 }
 
 func loadHooksConfig(projectRoot string) (*agent.HookManager, error) {

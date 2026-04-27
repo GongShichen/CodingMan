@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,5 +197,56 @@ func TestSessionMemoryBudgetTruncatesSystemInjection(t *testing.T) {
 	})
 	if _, err := a.Chat(context.Background(), "hello"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSkillAllowToolsRestrictsRuntimeTools(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, ".codingman", "skills", "echo-only", "SKILL.md"), "---\nname: echo-only\ndescription: echo only\nallow_tools: [echo]\ncontext: fork\n---\n")
+	readPath := filepath.Join(project, "readme.txt")
+	writeFile(t, readPath, "readable\n")
+	registry := tool.NewRegistry()
+	if err := registry.Register(echoTool{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(tool.NewReadTool()); err != nil {
+		t.Fatal(err)
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM:      &fakeLLM{},
+		Registry: registry,
+		Context: agent.ContextConfig{
+			Cwd:         project,
+			ProjectRoot: project,
+			BaseSystem:  "base",
+			LoadSkills:  true,
+		},
+		Permission: agent.PermissionConfig{
+			Mode:         agent.PermissionModeAllowDeny,
+			AllowedTools: []string{"echo", "read"},
+		},
+	})
+	if _, err := a.ExecuteTool(context.Background(), map[string]any{
+		"name":      "read",
+		"arguments": fmt.Sprintf(`{"filePath":%q}`, readPath),
+	}); err != nil {
+		t.Fatalf("loaded but inactive skill should not restrict tools: %v", err)
+	}
+	if err := a.SetActiveSkill("echo-only"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ExecuteTool(context.Background(), map[string]any{
+		"name":      "echo",
+		"arguments": `{"value":"ok"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ExecuteTool(context.Background(), map[string]any{
+		"name":      "read",
+		"arguments": fmt.Sprintf(`{"filePath":%q}`, readPath),
+	}); err == nil || !strings.Contains(err.Error(), "allow_tools") {
+		t.Fatalf("expected skill allow_tools denial, got %v", err)
 	}
 }

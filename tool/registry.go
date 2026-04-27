@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -121,9 +122,16 @@ func (r *Registry) MustGet(name string) Tool {
 }
 
 func (r *Registry) Call(name string, input map[string]any) (string, error) {
+	return r.CallContext(context.Background(), name, input)
+}
+
+func (r *Registry) CallContext(ctx context.Context, name string, input map[string]any) (string, error) {
 	tool, err := r.Get(name)
 	if err != nil {
 		return "", err
+	}
+	if contextTool, ok := tool.(ContextTool); ok {
+		return contextTool.CallContext(ctx, input)
 	}
 	return tool.Call(input)
 }
@@ -207,6 +215,12 @@ func (n namedFactoryTool) Name() string                { return n.name }
 func (n namedFactoryTool) Description() string         { return n.tool.Description() }
 func (n namedFactoryTool) InputSchema() map[string]any { return n.tool.InputSchema() }
 func (n namedFactoryTool) Call(input map[string]any) (string, error) {
+	return n.tool.Call(input)
+}
+func (n namedFactoryTool) CallContext(ctx context.Context, input map[string]any) (string, error) {
+	if contextTool, ok := n.tool.(ContextTool); ok {
+		return contextTool.CallContext(ctx, input)
+	}
 	return n.tool.Call(input)
 }
 func (n namedFactoryTool) ToAPIFormat() map[string]any {

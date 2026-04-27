@@ -125,6 +125,76 @@ func TestLoadProjectMemoryProgressiveIndex(t *testing.T) {
 	}
 }
 
+func TestLoadSkillsUserProjectOverrideAndContextModes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+	writeFile(t, filepath.Join(home, ".codingman", "skills", "review", "SKILL.md"), "---\nname: review\ndescription: user review skill\nallow_tools: [read]\ncontext: inline\n---\nuser inline body\n")
+	writeFile(t, filepath.Join(project, ".codingman", "skills", "review", "SKILL.md"), "---\nname: review\ndescription: project review skill\nallow_tools: [read, grep]\ncontext: fork\n---\nproject body should not inline\n")
+	writeFile(t, filepath.Join(project, ".codingman", "skills", "build", "SKILL.md"), "---\nname: build\ndescription: build skill\ncontext: inline\n---\nbuild inline body\n")
+
+	result := agent.LoadSkillsWithWarnings(agent.ContextConfig{
+		Cwd:         project,
+		ProjectRoot: project,
+		BaseSystem:  "base",
+	})
+	if len(result.Warnings) != 0 {
+		t.Fatalf("unexpected skill warnings: %+v", result.Warnings)
+	}
+	if len(result.Skills) != 2 {
+		t.Fatalf("expected two skills after override, got %+v", result.Skills)
+	}
+	if !strings.Contains(result.Content, "project review skill") || strings.Contains(result.Content, "user review skill") {
+		t.Fatalf("project skill did not override user skill:\n%s", result.Content)
+	}
+	if strings.Contains(result.Content, "project body should not inline") {
+		t.Fatalf("fork skill body was inlined:\n%s", result.Content)
+	}
+	if !strings.Contains(result.Content, "build inline body") {
+		t.Fatalf("inline skill body missing:\n%s", result.Content)
+	}
+	if !strings.Contains(result.Content, "allow_tools: read, grep") {
+		t.Fatalf("allow_tools missing:\n%s", result.Content)
+	}
+}
+
+func TestBuildSystemPromptIncludesSkills(t *testing.T) {
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, ".codingman", "skills", "docs", "SKILL.md"), "---\nname: docs\ndescription: documentation skill\ncontext: inline\n---\nwrite docs carefully\n")
+	system, err := agent.BuildSystemPromptWithConfig(agent.ContextConfig{
+		Cwd:          project,
+		ProjectRoot:  project,
+		BaseSystem:   "base",
+		IncludeDate:  false,
+		LoadAgentsMD: false,
+		LoadSkills:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(system, "## Skills") || !strings.Contains(system, "write docs carefully") {
+		t.Fatalf("skill missing from system prompt:\n%s", system)
+	}
+}
+
+func TestInlineSkillBudgetDefersLargeBody(t *testing.T) {
+	project := t.TempDir()
+	skillPath := filepath.Join(project, ".codingman", "skills", "large", "SKILL.md")
+	writeFile(t, skillPath, "---\nname: large\ndescription: large skill\ncontext: inline\n---\nlarge skill start\n"+strings.Repeat("x", 2000)+"\nlarge skill tail\n")
+	result := agent.LoadSkillsWithWarnings(agent.ContextConfig{
+		Cwd:                      project,
+		ProjectRoot:              project,
+		BaseSystem:               "base",
+		ProgressiveSkillMaxChars: 500,
+	})
+	if strings.Contains(result.Content, "large skill tail") {
+		t.Fatalf("large inline skill was not deferred:\n%s", result.Content)
+	}
+	if !strings.Contains(result.Content, "Skill 渐进式加载索引") || !strings.Contains(result.Content, skillPath) {
+		t.Fatalf("skill progressive index missing:\n%s", result.Content)
+	}
+}
+
 func writeFile(t *testing.T, path string, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {

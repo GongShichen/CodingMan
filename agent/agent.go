@@ -49,6 +49,10 @@ type Agent struct {
 	autoCompactThreshold     int
 	autoCompactKeepRecent    int
 	contextConfig            ContextConfig
+	skills                   []Skill
+	activeSkill              string
+	skillAllowedTools        map[string]struct{}
+	skillToolRestriction     bool
 	retryConfig              RetryConfig
 	permission               *PermissionManager
 	promptCache              PromptCacheConfig
@@ -59,6 +63,8 @@ type Agent struct {
 	coordinator              *Coordinator
 	coordinationConfig       CoordinationConfig
 	hooks                    *HookManager
+	mcp                      *MCPManager
+	cleanup                  []func() error
 	nextChildIndex           atomic.Uint64
 	maxSubAgentDepth         int
 	enableSelfReflection     bool
@@ -93,6 +99,7 @@ type AgentConfig struct {
 	A2ABus                   *A2ABus
 	Coordination             CoordinationConfig
 	Hooks                    *HookManager
+	MCP                      MCPConfig
 	ID                       string
 	Name                     string
 	ParentID                 string
@@ -133,6 +140,11 @@ func NewAgent(config AgentConfig) *Agent {
 	if loggerAware, ok := config.LLM.(LoggerAware); ok {
 		loggerAware.SetLogger(logger)
 	}
+	mcpManager, err := NewMCPManager(config.MCP, logger)
+	if err != nil {
+		logger.Log("", "mcp config_error=%v", err)
+		mcpManager = nil
+	}
 
 	contextConfig := config.Context
 	if contextConfig == (ContextConfig{}) {
@@ -146,6 +158,7 @@ func NewAgent(config AgentConfig) *Agent {
 	} else {
 		logger.Log("", "build_system_prompt error=%v", err)
 	}
+	loadedSkills := loadedSkillsForConfig(contextConfig)
 	maxCrossMemoryChars := defaultPositiveInt(config.MaxCrossMemoryChars, defaultMaxCrossMemoryChars)
 	var crossMemoryStore *CrossSessionMemoryStore
 	var crossMemoryJobs chan string
@@ -217,6 +230,7 @@ func NewAgent(config AgentConfig) *Agent {
 		autoCompactThreshold:     defaultAutoCompactThreshold(contextConfig.CompactThreshold),
 		autoCompactKeepRecent:    defaultAutoCompactKeepRecent(contextConfig.KeepRecentRounds),
 		contextConfig:            contextConfig,
+		skills:                   loadedSkills,
 		retryConfig:              defaultRetryConfig(config.RetryConfig),
 		permission:               permissionManager,
 		promptCache:              normalizePromptCacheConfig(promptCacheConfig),
@@ -226,8 +240,13 @@ func NewAgent(config AgentConfig) *Agent {
 		a2a:                      a2aBus,
 		coordinationConfig:       config.Coordination,
 		hooks:                    config.Hooks,
+		mcp:                      mcpManager,
 		maxSubAgentDepth:         defaultPositiveInt(config.MaxSubAgentDepth, defaultMaxSubAgentDepth),
 		enableSelfReflection:     defaultBool(config.EnableSelfReflection, true),
+	}
+	if mcpManager != nil {
+		agent.cleanup = append(agent.cleanup, mcpManager.Close)
+		mcpManager.Start(context.Background(), agent.registry)
 	}
 	agent.a2a.RegisterAgent(agent.id, agent.parentID)
 	agent.coordinator = NewCoordinator(agent, config.Coordination)
@@ -269,6 +288,50 @@ func defaultPositiveInt(value int, defaultValue int) int {
 		return value
 	}
 	return defaultValue
+}
+
+func loadedSkillsForConfig(config ContextConfig) []Skill {
+	if !config.LoadSkills {
+		return nil
+	}
+	return LoadSkillsWithWarnings(config).Skills
+}
+
+func skillToolAllowlist(skill Skill) (map[string]struct{}, bool) {
+	if len(skill.AllowTools) == 0 {
+		return nil, false
+	}
+	return toolAllowSet(skill.AllowTools), true
+}
+
+func toolAllowSet(values []string) map[string]struct{} {
+	allowed := make(map[string]struct{})
+	for _, name := range values {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			allowed[name] = struct{}{}
+		}
+	}
+	return allowed
+}
+
+func copyStringSet(values map[string]struct{}) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	copied := make(map[string]struct{}, len(values))
+	for key := range values {
+		copied[key] = struct{}{}
+	}
+	return copied
+}
+
+func toolNameAllowedBySkill(name string, allowed map[string]struct{}) bool {
+	if _, ok := allowed["*"]; ok {
+		return true
+	}
+	_, ok := allowed[name]
+	return ok
 }
 
 func NewAgentFromLLMConfig(llmConfig LLMConfig, contextConfig ContextConfig, model string) (*Agent, error) {
@@ -687,10 +750,78 @@ func (agent *Agent) Hooks() *HookManager {
 	return agent.hooks
 }
 
+func (agent *Agent) Close() error {
+	if agent == nil {
+		return nil
+	}
+	agent.mu.Lock()
+	cleanup := append([]func() error(nil), agent.cleanup...)
+	agent.cleanup = nil
+	agent.mu.Unlock()
+	var errs []string
+	for _, fn := range cleanup {
+		if fn == nil {
+			continue
+		}
+		if err := fn(); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
 func (agent *Agent) SystemPrompt() string {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	return agent.system
+}
+
+func (agent *Agent) Skills() []Skill {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return cloneSkills(agent.skills)
+}
+
+func (agent *Agent) ActiveSkill() (Skill, bool) {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if agent.activeSkill == "" {
+		return Skill{}, false
+	}
+	for _, skill := range agent.skills {
+		if skill.Name == agent.activeSkill {
+			return cloneSkill(skill), true
+		}
+	}
+	return Skill{Name: agent.activeSkill}, false
+}
+
+func (agent *Agent) SetActiveSkill(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("skill name must not be empty")
+	}
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	for _, skill := range agent.skills {
+		if skill.Name == name {
+			agent.activeSkill = skill.Name
+			agent.skillAllowedTools, agent.skillToolRestriction = skillToolAllowlist(skill)
+			return nil
+		}
+	}
+	return fmt.Errorf("skill %q not found", name)
+}
+
+func (agent *Agent) ClearActiveSkill() {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.activeSkill = ""
+	agent.skillAllowedTools = nil
+	agent.skillToolRestriction = false
 }
 
 func (agent *Agent) SetBaseSystemPrompt(baseSystem string) error {
@@ -722,6 +853,21 @@ func (agent *Agent) SetBaseSystemPrompt(baseSystem string) error {
 	defer agent.mu.Unlock()
 	agent.contextConfig = normalizeContextConfig(contextConfig)
 	agent.system = system
+	agent.skills = loadedSkillsForConfig(agent.contextConfig)
+	if agent.activeSkill == "" {
+		agent.skillAllowedTools = nil
+		agent.skillToolRestriction = false
+		return nil
+	}
+	for _, skill := range agent.skills {
+		if skill.Name == agent.activeSkill {
+			agent.skillAllowedTools, agent.skillToolRestriction = skillToolAllowlist(skill)
+			return nil
+		}
+	}
+	agent.activeSkill = ""
+	agent.skillAllowedTools = nil
+	agent.skillToolRestriction = false
 	return nil
 }
 
@@ -1635,11 +1781,19 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 	enableToolBudget := agent.enableToolBudget
 	toolBudget := agent.toolBudget
 	permission := agent.permission
+	activeSkill := agent.activeSkill
+	skillRestriction := agent.skillToolRestriction
+	skillAllowedTools := copyStringSet(agent.skillAllowedTools)
 	agent.mu.Unlock()
 
 	if registry == nil {
 		agent.log(traceID, "tool_prepare name=%s error=registry_nil", name)
 		return preparedToolExecution{}, errors.New("tool registry is nil")
+	}
+	if skillRestriction && !toolNameAllowedBySkill(name, skillAllowedTools) {
+		err := fmt.Errorf("tool %q is not allowed by active skill %q allow_tools", name, activeSkill)
+		agent.log(traceID, "tool_prepare name=%s active_skill=%s skill_allowlist_denied", name, activeSkill)
+		return preparedToolExecution{}, err
 	}
 
 	permissionCheck := PermissionCheck{ParallelSafe: true}
@@ -1780,7 +1934,11 @@ func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, er
 	if contextual, ok := toolInstance.(contextualTool); ok {
 		result, err = contextual.CallContext(prepared.ctx, prepared.input)
 	} else {
-		result, err = toolInstance.Call(prepared.input)
+		if contextTool, ok := toolInstance.(tool.ContextTool); ok {
+			result, err = contextTool.CallContext(prepared.ctx, prepared.input)
+		} else {
+			result, err = toolInstance.Call(prepared.input)
+		}
 	}
 	if prepared.enableToolBudget {
 		truncated, truncateErr := tool.TruncateToolResult(result, prepared.toolBudget.MaxLen, prepared.toolBudget.HeadLen, prepared.toolBudget.TailLen)

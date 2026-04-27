@@ -50,6 +50,23 @@ func TestLoadRuntimeConfigDefaultsCwdToLaunchDir(t *testing.T) {
 	}
 }
 
+func TestParseMCPServersSupportsMapAndArray(t *testing.T) {
+	mapped, err := parseMCPServers([]byte(`{"mcpServers":{"docs":{"transport":"http","url":"http://example.test/mcp"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mapped) != 1 || mapped[0].Name != "docs" || mapped[0].URL == "" {
+		t.Fatalf("unexpected mapped mcp config: %+v", mapped)
+	}
+	list, err := parseMCPServers([]byte(`{"mcp_servers":[{"name":"local","transport":"stdio","command":"mcp"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Name != "local" || list[0].Command != "mcp" {
+		t.Fatalf("unexpected list mcp config: %+v", list)
+	}
+}
+
 type testLLM struct{}
 
 func (testLLM) Chat(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {
