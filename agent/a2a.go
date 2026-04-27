@@ -512,6 +512,7 @@ func (agent *Agent) runWorkerAgent(ctx context.Context, task *WorkerTask) (SubAg
 
 	agent.log(traceID, "a2a subagent start child=%s name=%s task:\n%s", childID, childName, delegatedTask)
 	agent.a2a.RegisterAgent(childID, agent.id)
+	agent.runHooks(ctx, HookPayload{Event: HookEventNotification, AgentID: agent.id, TraceID: traceID, Message: "subagent started", SubagentID: childID, TaskID: task.ID})
 	if err := agent.a2a.Send(A2AMessage{
 		TraceID: traceID,
 		From:    agent.id,
@@ -551,6 +552,15 @@ func (agent *Agent) runWorkerAgent(ctx context.Context, task *WorkerTask) (SubAg
 	if sendErr := agent.a2a.Send(message); sendErr != nil && err == nil {
 		err = sendErr
 	}
+	agent.runHooks(ctx, HookPayload{
+		Event:      HookEventSubagentStop,
+		AgentID:    agent.id,
+		TraceID:    traceID,
+		Message:    resp.Content,
+		StopReason: resp.StopReason,
+		TaskID:     task.ID,
+		SubagentID: childID,
+	})
 	agent.log(traceID, "a2a subagent end child=%s stop=%s error=%v", childID, resp.StopReason, err)
 	return result, err
 }

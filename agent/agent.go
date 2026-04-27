@@ -50,6 +50,7 @@ type Agent struct {
 	a2a                      *A2ABus
 	coordinator              *Coordinator
 	coordinationConfig       CoordinationConfig
+	hooks                    *HookManager
 	nextChildIndex           atomic.Uint64
 	maxSubAgentDepth         int
 	enableSelfReflection     bool
@@ -78,6 +79,7 @@ type AgentConfig struct {
 	Logger                   Logger
 	A2ABus                   *A2ABus
 	Coordination             CoordinationConfig
+	Hooks                    *HookManager
 	ID                       string
 	Name                     string
 	ParentID                 string
@@ -184,6 +186,7 @@ func NewAgent(config AgentConfig) *Agent {
 		logger:                   logger,
 		a2a:                      a2aBus,
 		coordinationConfig:       config.Coordination,
+		hooks:                    config.Hooks,
 		maxSubAgentDepth:         defaultPositiveInt(config.MaxSubAgentDepth, defaultMaxSubAgentDepth),
 		enableSelfReflection:     defaultBool(config.EnableSelfReflection, true),
 	}
@@ -388,6 +391,9 @@ func (agent *Agent) Plan(ctx context.Context, prompt string, blocks ...ContentBl
 
 func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...ContentBlock) (LLMResponse, error) {
 	ctx, traceID := ensureTrace(ctx)
+	defer func() {
+		agent.runHooks(ctx, HookPayload{Event: HookEventStop, AgentID: agent.ID(), TraceID: traceID, Message: "tool loop stopped"})
+	}()
 	agent.log(traceID, "tool_loop start prompt_chars=%d blocks=%d", len(prompt), len(blocks))
 	agent.log(traceID, "user message:\n%s", formatContentForLog(prompt, blocks))
 	if err := agent.appendUserMessage(prompt, blocks...); err != nil {
@@ -630,6 +636,12 @@ func (agent *Agent) Coordinator() *Coordinator {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	return agent.coordinator
+}
+
+func (agent *Agent) Hooks() *HookManager {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	return agent.hooks
 }
 
 func (agent *Agent) SystemPrompt() string {
@@ -889,13 +901,15 @@ func (agent *Agent) ExecuteTool(ctx context.Context, toolUse map[string]any) (st
 		agent.log(traceID, "execute_tool prepare_error=%v", err)
 		return "", err
 	}
-	result, err := agent.callPreparedTool(prepared)
-	if err != nil {
+	result := ToolResult{ToolUse: prepared.toolUse}
+	agent.executePreparedToolIntoResult(prepared, &result)
+	if result.IsError {
+		err := errors.New(result.Content)
 		agent.log(traceID, "execute_tool name=%s error=%v", prepared.name, err)
-		return "", err
+		return result.Content, err
 	}
-	agent.log(traceID, "execute_tool name=%s result_chars=%d", prepared.name, len(result))
-	return result, nil
+	agent.log(traceID, "execute_tool name=%s result_chars=%d", prepared.name, len(result.Content))
+	return result.Content, nil
 }
 
 func (agent *Agent) ExecuteTools(ctx context.Context, toolUses []ToolUse, maxParallel int) []ToolResult {
@@ -1354,17 +1368,63 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 
 func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution, result *ToolResult) {
 	traceID := prepared.traceID
+	if updated := agent.runHooks(prepared.ctx, HookPayload{
+		Event:     HookEventPreToolUse,
+		AgentID:   agent.ID(),
+		TraceID:   traceID,
+		ToolUseID: prepared.toolUse.ID,
+		ToolName:  prepared.name,
+		Input:     prepared.input,
+	}).UpdatedInput; updated != nil {
+		prepared.input = updated
+		prepared.toolUse.Input = mustMarshalToolInput(updated)
+		result.ToolUse = prepared.toolUse
+	}
 	content, err := agent.callPreparedTool(prepared)
 	agent.recordToolFileActivity(prepared)
 	if err != nil {
 		agent.log(traceID, "tool_execute error name=%s id=%s output_chars=%d error=%v", prepared.name, prepared.toolUse.ID, len(content), err)
 		result.Content = formatToolErrorWithOutput(result.ToolUse, err, content)
 		result.IsError = true
+		agent.runHooks(prepared.ctx, HookPayload{
+			Event:     HookEventPostToolUse,
+			AgentID:   agent.ID(),
+			TraceID:   traceID,
+			ToolUseID: prepared.toolUse.ID,
+			ToolName:  prepared.name,
+			Input:     prepared.input,
+			Output:    content,
+			IsError:   true,
+			Message:   err.Error(),
+		})
 		return
 	}
 	result.Content = content
 	result.IsError = false
 	agent.log(traceID, "tool_execute success name=%s id=%s result_chars=%d", prepared.name, prepared.toolUse.ID, len(content))
+	agent.runHooks(prepared.ctx, HookPayload{
+		Event:     HookEventPostToolUse,
+		AgentID:   agent.ID(),
+		TraceID:   traceID,
+		ToolUseID: prepared.toolUse.ID,
+		ToolName:  prepared.name,
+		Input:     prepared.input,
+		Output:    content,
+	})
+}
+
+func (agent *Agent) runHooks(ctx context.Context, payload HookPayload) HookResult {
+	agent.mu.Lock()
+	hooks := agent.hooks
+	agent.mu.Unlock()
+	if hooks == nil {
+		return HookResult{}
+	}
+	result := hooks.Run(ctx, payload)
+	if result.Message != "" {
+		agent.log(payload.TraceID, "hook message event=%s tool=%s:\n%s", payload.Event, payload.ToolName, result.Message)
+	}
+	return result
 }
 
 func (agent *Agent) recordToolFileActivity(prepared preparedToolExecution) {

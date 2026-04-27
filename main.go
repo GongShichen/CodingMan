@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -51,6 +52,7 @@ type RuntimeConfig struct {
 	Retry            agent.RetryConfig
 	PromptCache      agent.PromptCacheConfig
 	Coordination     agent.CoordinationConfig
+	Hooks            *agent.HookManager
 	LogPath          string
 }
 
@@ -99,6 +101,7 @@ func main() {
 		RetryConfig:              cfg.Retry,
 		PromptCache:              cfg.PromptCache,
 		Coordination:             cfg.Coordination,
+		Hooks:                    cfg.Hooks,
 		Logger:                   logger,
 	})
 
@@ -614,6 +617,9 @@ func (tui *tuiController) runAgent(a *agent.Agent, prompt string) (agent.LLMResp
 		return result.resp, false, result.err
 	}
 
+	spinnerStop := startSpinner("running")
+	defer spinnerStop()
+
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		result := <-done
@@ -722,6 +728,27 @@ func (tui *tuiController) readSelection(ctx context.Context) (string, error) {
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+func startSpinner(status string) func() {
+	done := make(chan struct{})
+	go func() {
+		frames := []string{"-", "\\", "|", "/"}
+		ticker := time.NewTicker(120 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-done:
+				fmt.Printf("\r%s%s%s\r", colorGray, strings.Repeat(" ", len(status)+4), colorReset)
+				return
+			case <-ticker.C:
+				fmt.Printf("\r%s%s %s%s", colorGray, frames[i%len(frames)], status, colorReset)
+				i++
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 var markdownImagePattern = regexp.MustCompile(`!\[[^\]]*]\(([^)]+)\)`)
@@ -932,6 +959,11 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 		EnableGitWorktree: boolValue(values, "WORKER_GIT_WORKTREE", false),
 		WorktreeBaseDir:   values["WORKER_WORKTREE_BASE_DIR"],
 	}
+	hooks, err := loadHooksConfig(projectRoot)
+	if err != nil {
+		return RuntimeConfig{}, "", err
+	}
+	cfg.Hooks = hooks
 
 	cfg.EnableToolBudget = boolValue(values, "ENABLE_TOOL_BUDGET", true)
 	cfg.ToolBudget = agent.ToolBudget{
@@ -976,6 +1008,32 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 		return fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+func loadHooksConfig(projectRoot string) (*agent.HookManager, error) {
+	var merged agent.HooksConfig
+	paths := []string{}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".codingman", "settings.json"))
+	}
+	paths = append(paths, filepath.Join(projectRoot, "settings.json"))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		var fileConfig struct {
+			Hooks []agent.HookConfig `json:"hooks"`
+		}
+		if err := json.Unmarshal(data, &fileConfig); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		merged.Hooks = append(merged.Hooks, fileConfig.Hooks...)
+	}
+	return agent.NewHookManager(merged)
 }
 
 func readDotEnv(path string) (map[string]string, error) {
