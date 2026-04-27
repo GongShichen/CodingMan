@@ -250,3 +250,93 @@ func TestSkillAllowToolsRestrictsRuntimeTools(t *testing.T) {
 		t.Fatalf("expected skill allow_tools denial, got %v", err)
 	}
 }
+
+func TestSkillEvolutionCreatesUserSkillAfterThreshold(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var reviewCalls atomic.Int64
+	llm := &fakeLLM{
+		chatFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {
+			reviewCalls.Add(1)
+			prompt := agent.FormatMessages(messages)
+			if !strings.Contains(prompt, "经验审查器") || !strings.Contains(prompt, "严格 JSON 数组") {
+				t.Fatalf("unexpected skill evolution prompt:\n%s", prompt)
+			}
+			return agent.LLMResponse{Content: `[{"action":"create","name":"Go Test Fixes","description":"Capture reusable Go test debugging workflow.","content":"---\nname: go-test-fixes\ndescription: Capture reusable Go test debugging workflow.\nallow_tools: [read, grep, bash, edit]\ncontext: fork\n---\n\n# Go Test Fixes\n\nRun focused tests, inspect exact failure output, then patch the smallest failing surface.\n"}]`, StopReason: "completed"}, nil
+		},
+	}
+	registry := tool.NewRegistry()
+	if err := registry.Register(echoTool{}); err != nil {
+		t.Fatal(err)
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM:                     llm,
+		Registry:                registry,
+		SessionMemoryThreshold:  100,
+		SkillEvolutionThreshold: 2,
+		Permission: agent.PermissionConfig{
+			Mode:         agent.PermissionModeAllowDeny,
+			AllowedTools: []string{"echo"},
+		},
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := a.ExecuteTool(context.Background(), map[string]any{
+			"name":      "echo",
+			"arguments": `{"value":"ok"}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if reviewCalls.Load() != 1 {
+		t.Fatalf("expected one skill review, got %d", reviewCalls.Load())
+	}
+	path := filepath.Join(home, ".codingman", "skills", "go-test-fixes", "SKILL.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "Run focused tests") {
+		t.Fatalf("skill content missing:\n%s", string(data))
+	}
+
+	if err := a.SetActiveSkill("go-test-fixes"); err != nil {
+		t.Fatalf("created skill was not reloaded: %v", err)
+	}
+}
+
+func TestSkillEvolutionEmptyReviewResetsCounter(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var reviewCalls atomic.Int64
+	llm := &fakeLLM{
+		chatFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {
+			reviewCalls.Add(1)
+			return agent.LLMResponse{Content: `[]`, StopReason: "completed"}, nil
+		},
+	}
+	registry := tool.NewRegistry()
+	if err := registry.Register(echoTool{}); err != nil {
+		t.Fatal(err)
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM:                     llm,
+		Registry:                registry,
+		SessionMemoryThreshold:  100,
+		SkillEvolutionThreshold: 2,
+		Permission: agent.PermissionConfig{
+			Mode:         agent.PermissionModeAllowDeny,
+			AllowedTools: []string{"echo"},
+		},
+	})
+	for i := 0; i < 3; i++ {
+		if _, err := a.ExecuteTool(context.Background(), map[string]any{
+			"name":      "echo",
+			"arguments": `{"value":"ok"}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if reviewCalls.Load() != 1 {
+		t.Fatalf("expected one review after counter reset, got %d", reviewCalls.Load())
+	}
+}

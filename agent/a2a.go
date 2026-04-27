@@ -492,6 +492,8 @@ func (agent *Agent) runWorkerAgent(ctx context.Context, task *WorkerTask) (SubAg
 		MaxConsecutiveToolErrors: agent.maxConsecutiveToolErrors,
 		MaxConsecutiveAPIErrors:  agent.maxConsecutiveAPIErrors,
 		MaxConcurrentSubAgents:   agent.maxConcurrentSubAgents,
+		SessionMemoryThreshold:   agent.sessionMemoryThreshold,
+		SkillEvolutionThreshold:  agent.skillEvolutionThreshold,
 		EnableToolBudget:         agent.enableToolBudget,
 		ToolBudget:               agent.toolBudget,
 		RetryConfig:              agent.retryConfig,

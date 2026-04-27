@@ -15,59 +15,61 @@ import (
 )
 
 type Agent struct {
-	mu                       sync.Mutex
-	id                       string
-	name                     string
-	parentID                 string
-	depth                    int
-	llm                      LLM
-	registry                 *tool.Registry
-	system                   string
-	model                    string
-	messages                 []Message
-	fileHistory              []FileHistoryEntry
-	attribution              []AttributionEntry
-	todos                    []TodoItem
-	sessionMemory            []SessionMemoryEntry
-	toolCallsSinceMemory     int
-	sessionMemoryThreshold   int
-	maxSessionMemoryEntries  int
-	maxSessionMemoryChars    int
-	crossMemoryStore         *CrossSessionMemoryStore
-	maxCrossMemoryChars      int
-	crossMemoryJobs          chan string
-	turns                    int
-	maxTurn                  int
-	maxToolCalls             int
-	maxParallelToolCalls     int
-	maxConsecutiveToolErrors int
-	maxConsecutiveAPIErrors  int
-	maxConcurrentSubAgents   int
-	enableToolBudget         bool
-	toolBudget               ToolBudget
-	enableAutoCompact        bool
-	autoCompactThreshold     int
-	autoCompactKeepRecent    int
-	contextConfig            ContextConfig
-	skills                   []Skill
-	activeSkill              string
-	skillAllowedTools        map[string]struct{}
-	skillToolRestriction     bool
-	retryConfig              RetryConfig
-	permission               *PermissionManager
-	promptCache              PromptCacheConfig
-	enableStreamRecovery     bool
-	streamRecoveryMaxRetries int
-	logger                   Logger
-	a2a                      *A2ABus
-	coordinator              *Coordinator
-	coordinationConfig       CoordinationConfig
-	hooks                    *HookManager
-	mcp                      *MCPManager
-	cleanup                  []func() error
-	nextChildIndex           atomic.Uint64
-	maxSubAgentDepth         int
-	enableSelfReflection     bool
+	mu                        sync.Mutex
+	id                        string
+	name                      string
+	parentID                  string
+	depth                     int
+	llm                       LLM
+	registry                  *tool.Registry
+	system                    string
+	model                     string
+	messages                  []Message
+	fileHistory               []FileHistoryEntry
+	attribution               []AttributionEntry
+	todos                     []TodoItem
+	sessionMemory             []SessionMemoryEntry
+	toolCallsSinceMemory      int
+	toolCallsSinceSkillReview int
+	sessionMemoryThreshold    int
+	skillEvolutionThreshold   int
+	maxSessionMemoryEntries   int
+	maxSessionMemoryChars     int
+	crossMemoryStore          *CrossSessionMemoryStore
+	maxCrossMemoryChars       int
+	crossMemoryJobs           chan string
+	turns                     int
+	maxTurn                   int
+	maxToolCalls              int
+	maxParallelToolCalls      int
+	maxConsecutiveToolErrors  int
+	maxConsecutiveAPIErrors   int
+	maxConcurrentSubAgents    int
+	enableToolBudget          bool
+	toolBudget                ToolBudget
+	enableAutoCompact         bool
+	autoCompactThreshold      int
+	autoCompactKeepRecent     int
+	contextConfig             ContextConfig
+	skills                    []Skill
+	activeSkill               string
+	skillAllowedTools         map[string]struct{}
+	skillToolRestriction      bool
+	retryConfig               RetryConfig
+	permission                *PermissionManager
+	promptCache               PromptCacheConfig
+	enableStreamRecovery      bool
+	streamRecoveryMaxRetries  int
+	logger                    Logger
+	a2a                       *A2ABus
+	coordinator               *Coordinator
+	coordinationConfig        CoordinationConfig
+	hooks                     *HookManager
+	mcp                       *MCPManager
+	cleanup                   []func() error
+	nextChildIndex            atomic.Uint64
+	maxSubAgentDepth          int
+	enableSelfReflection      bool
 }
 
 type AgentConfig struct {
@@ -83,6 +85,7 @@ type AgentConfig struct {
 	MaxConsecutiveAPIErrors  int
 	MaxConcurrentSubAgents   int
 	SessionMemoryThreshold   int
+	SkillEvolutionThreshold  int
 	MaxSessionMemoryEntries  int
 	MaxSessionMemoryChars    int
 	EnableCrossSessionMemory *bool
@@ -123,6 +126,7 @@ const (
 	defaultMaxSubAgentDepth         = 1
 	defaultMaxConcurrentSubAgents   = 4
 	defaultSessionMemoryThreshold   = 10
+	defaultSkillEvolutionThreshold  = 10
 	defaultMaxSessionMemoryEntries  = 8
 	defaultMaxSessionMemoryChars    = 8000
 	defaultMaxCrossMemoryChars      = 12000
@@ -213,6 +217,7 @@ func NewAgent(config AgentConfig) *Agent {
 		todos:                    make([]TodoItem, 0),
 		sessionMemory:            make([]SessionMemoryEntry, 0),
 		sessionMemoryThreshold:   defaultPositiveInt(config.SessionMemoryThreshold, defaultSessionMemoryThreshold),
+		skillEvolutionThreshold:  defaultPositiveInt(config.SkillEvolutionThreshold, defaultSkillEvolutionThreshold),
 		maxSessionMemoryEntries:  defaultPositiveInt(config.MaxSessionMemoryEntries, defaultMaxSessionMemoryEntries),
 		maxSessionMemoryChars:    defaultPositiveInt(config.MaxSessionMemoryChars, defaultMaxSessionMemoryChars),
 		crossMemoryStore:         crossMemoryStore,
@@ -585,6 +590,9 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 		agent.appendToolResultMessages(results)
 		if agent.MaybeUpdateSessionMemory(ctx) {
 			agent.log(traceID, "session_memory updated total=%d", len(agent.SessionMemory()))
+		}
+		if agent.MaybeEvolveSkills(ctx) {
+			agent.log(traceID, "skill_evolution completed")
 		}
 		agent.log(traceID, "tool_loop tool_results count=%d total_tool_calls=%d", len(results), toolCalls)
 		for _, result := range results {
@@ -978,6 +986,7 @@ func (agent *Agent) Restore(snapshot SessionSnapshot) {
 	agent.todos = append([]TodoItem(nil), snapshot.Todos...)
 	agent.sessionMemory = append([]SessionMemoryEntry(nil), snapshot.Memory...)
 	agent.toolCallsSinceMemory = 0
+	agent.toolCallsSinceSkillReview = 0
 	agent.turns = countAssistantTurns(agent.messages)
 }
 
@@ -995,6 +1004,7 @@ func (agent *Agent) RecordToolCall(toolName string) {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	agent.toolCallsSinceMemory++
+	agent.toolCallsSinceSkillReview++
 }
 
 func (agent *Agent) MaybeUpdateSessionMemory(ctxs ...context.Context) bool {
@@ -1360,9 +1370,11 @@ func (agent *Agent) ExecuteTool(ctx context.Context, toolUse map[string]any) (st
 		err := errors.New(result.Content)
 		agent.log(traceID, "execute_tool name=%s error=%v", prepared.name, err)
 		agent.MaybeUpdateSessionMemory(prepared.ctx)
+		agent.MaybeEvolveSkills(prepared.ctx)
 		return result.Content, err
 	}
 	agent.MaybeUpdateSessionMemory(prepared.ctx)
+	agent.MaybeEvolveSkills(prepared.ctx)
 	agent.log(traceID, "execute_tool name=%s result_chars=%d", prepared.name, len(result.Content))
 	return result.Content, nil
 }

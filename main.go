@@ -48,6 +48,7 @@ type RuntimeConfig struct {
 	MaxSubAgentDepth        int
 	MaxSubAgents            int
 	SessionMemoryThreshold  int
+	SkillEvolutionThreshold int
 	MaxSessionMemoryEntries int
 	MaxSessionMemoryChars   int
 	MaxCrossMemoryChars     int
@@ -102,6 +103,7 @@ func main() {
 		MaxConcurrentSubAgents:   cfg.MaxSubAgents,
 		MaxSubAgentDepth:         cfg.MaxSubAgentDepth,
 		SessionMemoryThreshold:   cfg.SessionMemoryThreshold,
+		SkillEvolutionThreshold:  cfg.SkillEvolutionThreshold,
 		MaxSessionMemoryEntries:  cfg.MaxSessionMemoryEntries,
 		MaxSessionMemoryChars:    cfg.MaxSessionMemoryChars,
 		MaxCrossMemoryChars:      cfg.MaxCrossMemoryChars,
@@ -1028,6 +1030,7 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 	cfg.MaxSubAgentDepth = intValue(values, "MAX_SUB_AGENT_DEPTH", 1)
 	cfg.MaxSubAgents = intValue(values, "MAX_CONCURRENT_SUB_AGENTS", 4)
 	cfg.SessionMemoryThreshold = intValue(values, "SESSION_MEMORY_TOOL_THRESHOLD", 10)
+	cfg.SkillEvolutionThreshold = intValue(values, "SKILL_EVOLUTION_TOOL_THRESHOLD", 10)
 	cfg.MaxSessionMemoryEntries = intValue(values, "SESSION_MEMORY_MAX_ENTRIES", 8)
 	cfg.MaxSessionMemoryChars = intValue(values, "SESSION_MEMORY_MAX_CHARS", 8000)
 	cfg.MaxCrossMemoryChars = intValue(values, "CROSS_SESSION_MEMORY_MAX_CHARS", 12000)
