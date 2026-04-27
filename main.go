@@ -939,6 +939,7 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 		Context:   agent.DefaultContextConfig(),
 	}
 	cfg.Context.Cwd = valueOrDefault(values["CWD"], launchDir)
+	cfg.Context.ProjectRoot = valueOrDefault(values["PROJECT_ROOT"], findMemoryProjectRoot(cfg.Context.Cwd))
 	cfg.Context.BaseSystem = values["BASE_SYSTEM"]
 	cfg.Context.IncludeDate = boolValue(values, "INCLUDE_DATE", cfg.Context.IncludeDate)
 	cfg.Context.LoadAgentsMD = boolValue(values, "LOAD_AGENTS_MD", cfg.Context.LoadAgentsMD)
@@ -1090,6 +1091,29 @@ func findProjectRoot(start string) (string, error) {
 		parent := filepath.Dir(current)
 		if parent == current {
 			return "", errors.New("go.mod not found")
+		}
+		current = parent
+	}
+}
+
+func findMemoryProjectRoot(start string) string {
+	current, err := filepath.Abs(start)
+	if err != nil {
+		return start
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(current, ".git")); err == nil {
+			return current
+		}
+		if _, err := os.Stat(filepath.Join(current, "go.mod")); err == nil {
+			return current
+		}
+		if _, err := os.Stat(filepath.Join(current, ".codingman")); err == nil {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return start
 		}
 		current = parent
 	}
