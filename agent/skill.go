@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,12 +14,16 @@ import (
 const defaultProgressiveSkillMaxChars = 12000
 
 type Skill struct {
-	Name        string
-	Description string
-	AllowTools  []string
-	Context     string
-	Path        string
-	Content     string
+	Name               string
+	Description        string
+	AllowTools         []string
+	Context            string
+	Path               string
+	Content            string
+	CodingManGenerated bool
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	UserLevel          bool
 }
 
 type SkillLoadResult struct {
@@ -113,10 +118,13 @@ func loadSkillFile(path string, projectRoot string) (Skill, error) {
 	}
 	body, frontmatter := splitFrontmatter(string(data))
 	var metadata struct {
-		Name        string   `yaml:"name"`
-		Description string   `yaml:"description"`
-		AllowTools  []string `yaml:"allow_tools"`
-		Context     string   `yaml:"context"`
+		Name               string   `yaml:"name"`
+		Description        string   `yaml:"description"`
+		AllowTools         []string `yaml:"allow_tools"`
+		Context            string   `yaml:"context"`
+		CodingManGenerated bool     `yaml:"codingman_generated"`
+		CreatedAt          string   `yaml:"created_at"`
+		UpdatedAt          string   `yaml:"updated_at"`
 	}
 	if strings.TrimSpace(frontmatter) != "" {
 		if err := yaml.Unmarshal([]byte(frontmatter), &metadata); err != nil {
@@ -133,14 +141,88 @@ func loadSkillFile(path string, projectRoot string) (Skill, error) {
 	if contextMode != "fork" && contextMode != "inline" {
 		return Skill{}, fmt.Errorf("unsupported skill context %q", contextMode)
 	}
+	createdAt := parseSkillTime(metadata.CreatedAt)
+	updatedAt := parseSkillTime(metadata.UpdatedAt)
 	return Skill{
-		Name:        strings.TrimSpace(metadata.Name),
-		Description: strings.TrimSpace(metadata.Description),
-		AllowTools:  compactStrings(metadata.AllowTools),
-		Context:     contextMode,
-		Path:        resolved,
-		Content:     strings.TrimSpace(stripHTMLComments(body)),
+		Name:               strings.TrimSpace(metadata.Name),
+		Description:        strings.TrimSpace(metadata.Description),
+		AllowTools:         compactStrings(metadata.AllowTools),
+		Context:            contextMode,
+		Path:               resolved,
+		Content:            strings.TrimSpace(stripHTMLComments(body)),
+		CodingManGenerated: metadata.CodingManGenerated,
+		CreatedAt:          createdAt,
+		UpdatedAt:          updatedAt,
+		UserLevel:          isUserSkillPath(resolved),
 	}, nil
+}
+
+func parseSkillTime(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+		parsed, err := time.Parse(layout, value)
+		if err == nil {
+			return parsed
+		}
+	}
+	return time.Time{}
+}
+
+func userSkillRoot() (string, bool) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false
+	}
+	return cleanRealPath(filepath.Join(home, ".codingman", "skills")), true
+}
+
+func isUserSkillPath(path string) bool {
+	root, ok := userSkillRoot()
+	if !ok || root == "" {
+		return false
+	}
+	return isWithinDir(root, cleanRealPath(path))
+}
+
+func LoadUserSkillsWithWarnings(config ContextConfig) SkillLoadResult {
+	config = normalizeContextConfig(config)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return SkillLoadResult{}
+	}
+	var warnings []string
+	var skills []Skill
+	for _, file := range skillFilesInDir(filepath.Join(home, ".codingman", "skills")) {
+		skill, err := loadSkillFile(file, config.ProjectRoot)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("%s: %v", file, err))
+			continue
+		}
+		if skill.Name == "" {
+			warnings = append(warnings, fmt.Sprintf("%s: skill name is required", file))
+			continue
+		}
+		skills = append(skills, skill)
+	}
+	return SkillLoadResult{
+		Skills:   skills,
+		Content:  renderSkills(skills, config.ProgressiveSkillMaxChars),
+		Warnings: warnings,
+	}
+}
+
+func fullSkillContent(skill Skill) string {
+	if strings.TrimSpace(skill.Path) == "" {
+		return strings.TrimSpace(skill.Content)
+	}
+	data, err := os.ReadFile(skill.Path)
+	if err != nil {
+		return strings.TrimSpace(skill.Content)
+	}
+	return strings.TrimSpace(stripHTMLComments(string(data)))
 }
 
 func safeResolveSkillFile(path string, projectRoot string) (string, error) {

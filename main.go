@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"mime"
@@ -49,6 +50,7 @@ type RuntimeConfig struct {
 	MaxSubAgents            int
 	SessionMemoryThreshold  int
 	SkillEvolutionThreshold int
+	SkillEviction           agent.SkillEvictionConfig
 	MaxSessionMemoryEntries int
 	MaxSessionMemoryChars   int
 	MaxCrossMemoryChars     int
@@ -57,12 +59,27 @@ type RuntimeConfig struct {
 	Retry                   agent.RetryConfig
 	PromptCache             agent.PromptCacheConfig
 	Coordination            agent.CoordinationConfig
+	Permission              agent.PermissionConfig
 	Hooks                   *agent.HookManager
 	MCP                     agent.MCPConfig
 	LogPath                 string
 }
 
+type CLIOptions struct {
+	NonInteractive bool
+	Prompt         string
+	PromptFile     string
+	Cwd            string
+	Permission     string
+	MaxLLMTurns    int
+	MaxToolCalls   int
+}
+
 func main() {
+	options, err := parseCLIOptions(os.Args[1:])
+	if err != nil {
+		fatal("parse args", err)
+	}
 	launchDir, err := os.Getwd()
 	if err != nil {
 		fatal("get working directory", err)
@@ -75,6 +92,9 @@ func main() {
 	cfg, source, err := loadRuntimeConfig(projectRoot, launchDir)
 	if err != nil {
 		fatal("load config", err)
+	}
+	if err := applyCLIOptions(&cfg, options); err != nil {
+		fatal("apply args", err)
 	}
 
 	client, err := agent.CreateLLM(agent.LLMConfig{
@@ -104,12 +124,14 @@ func main() {
 		MaxSubAgentDepth:         cfg.MaxSubAgentDepth,
 		SessionMemoryThreshold:   cfg.SessionMemoryThreshold,
 		SkillEvolutionThreshold:  cfg.SkillEvolutionThreshold,
+		SkillEviction:            cfg.SkillEviction,
 		MaxSessionMemoryEntries:  cfg.MaxSessionMemoryEntries,
 		MaxSessionMemoryChars:    cfg.MaxSessionMemoryChars,
 		MaxCrossMemoryChars:      cfg.MaxCrossMemoryChars,
 		EnableToolBudget:         cfg.EnableToolBudget,
 		ToolBudget:               cfg.ToolBudget,
 		RetryConfig:              cfg.Retry,
+		Permission:               cfg.Permission,
 		PromptCache:              cfg.PromptCache,
 		Coordination:             cfg.Coordination,
 		Hooks:                    cfg.Hooks,
@@ -118,7 +140,105 @@ func main() {
 	})
 	defer a.Close()
 
+	if options.NonInteractive {
+		if err := RunHeadless(a, options); err != nil {
+			fatal("run headless", err)
+		}
+		return
+	}
 	RunTUI(a, cfg, source)
+}
+
+func parseCLIOptions(args []string) (CLIOptions, error) {
+	var options CLIOptions
+	flags := flag.NewFlagSet("codingman", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.BoolVar(&options.NonInteractive, "non-interactive", false, "run one prompt and exit")
+	flags.StringVar(&options.Prompt, "prompt", "", "prompt text for non-interactive mode")
+	flags.StringVar(&options.PromptFile, "prompt-file", "", "path to a prompt file for non-interactive mode")
+	flags.StringVar(&options.Cwd, "cwd", "", "working directory for agent tools")
+	flags.StringVar(&options.Permission, "permission", "", "permission mode: ask, allow-deny, full-auto")
+	flags.IntVar(&options.MaxLLMTurns, "max-turns", 0, "maximum LLM turns")
+	flags.IntVar(&options.MaxToolCalls, "max-tool-calls", 0, "maximum tool calls")
+	if err := flags.Parse(args); err != nil {
+		return CLIOptions{}, err
+	}
+	if flags.NArg() > 0 {
+		return CLIOptions{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	if !options.NonInteractive {
+		if options.Prompt != "" || options.PromptFile != "" {
+			options.NonInteractive = true
+		}
+		return options, nil
+	}
+	if strings.TrimSpace(options.Prompt) == "" && strings.TrimSpace(options.PromptFile) == "" {
+		return CLIOptions{}, errors.New("--non-interactive requires --prompt or --prompt-file")
+	}
+	return options, nil
+}
+
+func applyCLIOptions(cfg *RuntimeConfig, options CLIOptions) error {
+	if cfg == nil {
+		return errors.New("runtime config is nil")
+	}
+	if strings.TrimSpace(options.Cwd) != "" {
+		absCwd, err := filepath.Abs(expandHome(options.Cwd))
+		if err != nil {
+			return err
+		}
+		cfg.Context.Cwd = absCwd
+		cfg.Context.ProjectRoot = findMemoryProjectRoot(absCwd)
+	}
+	if strings.TrimSpace(options.Permission) != "" {
+		mode, err := agent.ParsePermissionMode(options.Permission)
+		if err != nil {
+			return err
+		}
+		cfg.Permission.Mode = mode
+		if mode == agent.PermissionModeFullAuto {
+			cfg.Permission.AllowedTools = []string{"*"}
+		}
+	}
+	if options.MaxLLMTurns > 0 {
+		cfg.MaxLLMTurns = options.MaxLLMTurns
+	}
+	if options.MaxToolCalls > 0 {
+		cfg.MaxToolCalls = options.MaxToolCalls
+	}
+	return nil
+}
+
+func RunHeadless(a *agent.Agent, options CLIOptions) error {
+	a.SetEventSink(func(event agent.AgentEvent) {
+		printAgentEvent(os.Stderr, event)
+	})
+	prompt := strings.TrimSpace(options.Prompt)
+	if strings.TrimSpace(options.PromptFile) != "" {
+		data, err := os.ReadFile(expandHome(options.PromptFile))
+		if err != nil {
+			return err
+		}
+		if prompt != "" {
+			prompt += "\n\n"
+		}
+		prompt += string(data)
+	}
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("prompt is empty")
+	}
+	promptText, blocks, err := buildPromptContent(prompt)
+	if err != nil {
+		return err
+	}
+	resp, err := a.RunToolLoop(context.Background(), promptText, blocks...)
+	if resp.StopReason != "" {
+		fmt.Fprintf(os.Stderr, "stop_reason=%s\n", resp.StopReason)
+	}
+	if strings.TrimSpace(resp.Content) != "" {
+		fmt.Println(strings.TrimSpace(resp.Content))
+	}
+	return err
 }
 
 func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
@@ -132,6 +252,9 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 	if permissions := a.Permission(); permissions != nil {
 		permissions.SetAskFunc(tui.permissionPrompt)
 	}
+	a.SetEventSink(func(event agent.AgentEvent) {
+		printAgentEvent(os.Stdout, event)
+	})
 
 	printHeader(cfg, source)
 	printSessionHeader(session)
@@ -473,6 +596,48 @@ func printSkillStatus(a *agent.Agent) {
 			colorGray, colorReset, skill.Context,
 			colorGray, colorReset, allowTools,
 		)
+	}
+}
+
+func printAgentEvent(w io.Writer, event agent.AgentEvent) {
+	switch event.Type {
+	case agent.AgentEventSkillSelected:
+		if event.SkillSelected == nil {
+			return
+		}
+		skill := event.SkillSelected.Skill
+		if strings.TrimSpace(skill.Description) != "" {
+			fmt.Fprintf(w, "\n%susing skill:%s %s - %s\n", colorGray, colorReset, skill.Name, skill.Description)
+		} else {
+			fmt.Fprintf(w, "\n%susing skill:%s %s\n", colorGray, colorReset, skill.Name)
+		}
+	case agent.AgentEventFileDiff:
+		if event.FileDiff == nil || strings.TrimSpace(event.FileDiff.Diff) == "" {
+			return
+		}
+		fmt.Fprintf(w, "\n%sfile diff:%s %s\n", colorGray, colorReset, event.FileDiff.Path)
+		printColoredDiff(w, event.FileDiff.Diff)
+	}
+}
+
+func printColoredDiff(w io.Writer, diff string) {
+	for _, line := range strings.SplitAfter(diff, "\n") {
+		if line == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
+			fmt.Fprintf(w, "%s%s%s", colorGray, line, colorReset)
+		case strings.HasPrefix(line, "+"):
+			fmt.Fprintf(w, "%s%s%s", colorGreen, line, colorReset)
+		case strings.HasPrefix(line, "-"):
+			fmt.Fprintf(w, "%s%s%s", colorRed, line, colorReset)
+		default:
+			fmt.Fprint(w, line)
+		}
+	}
+	if !strings.HasSuffix(diff, "\n") {
+		fmt.Fprintln(w)
 	}
 }
 
@@ -1031,6 +1196,12 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 	cfg.MaxSubAgents = intValue(values, "MAX_CONCURRENT_SUB_AGENTS", 4)
 	cfg.SessionMemoryThreshold = intValue(values, "SESSION_MEMORY_TOOL_THRESHOLD", 10)
 	cfg.SkillEvolutionThreshold = intValue(values, "SKILL_EVOLUTION_TOOL_THRESHOLD", 10)
+	cfg.SkillEviction = agent.SkillEvictionConfig{
+		Enabled:            boolValue(values, "SKILL_EVICTION_ENABLED", true),
+		UnusedDays:         intValue(values, "SKILL_EVICTION_UNUSED_DAYS", 90),
+		MinUses:            intValue(values, "SKILL_EVICTION_MIN_USES", 3),
+		CheckIntervalHours: intValue(values, "SKILL_EVICTION_CHECK_INTERVAL_HOURS", 24),
+	}
 	cfg.MaxSessionMemoryEntries = intValue(values, "SESSION_MEMORY_MAX_ENTRIES", 8)
 	cfg.MaxSessionMemoryChars = intValue(values, "SESSION_MEMORY_MAX_CHARS", 8000)
 	cfg.MaxCrossMemoryChars = intValue(values, "CROSS_SESSION_MEMORY_MAX_CHARS", 12000)

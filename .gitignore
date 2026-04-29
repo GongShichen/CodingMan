@@ -1,6 +1,9 @@
 xsbin/
 bin/
 dist/
+.swebench-runs/
+swebench_preds*.json
+sb-cli-reports/
 
 # Go build artifacts
 CodingMan

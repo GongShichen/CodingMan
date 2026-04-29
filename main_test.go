@@ -67,6 +67,51 @@ func TestParseMCPServersSupportsMapAndArray(t *testing.T) {
 	}
 }
 
+func TestParseCLIOptionsEnablesNonInteractiveForPromptFile(t *testing.T) {
+	options, err := parseCLIOptions([]string{"--prompt-file", "task.md", "--cwd", "/tmp/repo", "--permission", "full-auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !options.NonInteractive {
+		t.Fatal("prompt-file should enable non-interactive mode")
+	}
+	if options.PromptFile != "task.md" || options.Cwd != "/tmp/repo" || options.Permission != "full-auto" {
+		t.Fatalf("unexpected options: %+v", options)
+	}
+}
+
+func TestParseCLIOptionsRequiresPromptForExplicitNonInteractive(t *testing.T) {
+	if _, err := parseCLIOptions([]string{"--non-interactive"}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestApplyCLIOptionsOverridesRuntimeConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg := RuntimeConfig{
+		Context:      agent.DefaultContextConfig(),
+		MaxLLMTurns:  20,
+		MaxToolCalls: 50,
+	}
+	if err := applyCLIOptions(&cfg, CLIOptions{
+		Cwd:          dir,
+		Permission:   "full-auto",
+		MaxLLMTurns:  3,
+		MaxToolCalls: 4,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Context.Cwd != dir {
+		t.Fatalf("cwd = %q, want %q", cfg.Context.Cwd, dir)
+	}
+	if cfg.Permission.Mode != agent.PermissionModeFullAuto {
+		t.Fatalf("permission mode = %q", cfg.Permission.Mode)
+	}
+	if cfg.MaxLLMTurns != 3 || cfg.MaxToolCalls != 4 {
+		t.Fatalf("limits not overridden: turns=%d tools=%d", cfg.MaxLLMTurns, cfg.MaxToolCalls)
+	}
+}
+
 type testLLM struct{}
 
 func (testLLM) Chat(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -296,8 +297,9 @@ func ensureUserSkillPathSafe(base string, path string) error {
 
 func ensureSkillDocument(item SkillEvolutionItem, safeName string) string {
 	content := strings.TrimSpace(item.Content)
+	now := time.Now().UTC().Format(time.RFC3339)
 	if strings.HasPrefix(content, "---") {
-		return content + "\n"
+		return ensureGeneratedSkillFrontmatter(content, now) + "\n"
 	}
 	description := strings.TrimSpace(item.Description)
 	if description == "" {
@@ -311,12 +313,62 @@ func ensureSkillDocument(item SkillEvolutionItem, safeName string) string {
 	builder.WriteString("description: ")
 	builder.WriteString(description)
 	builder.WriteString("\n")
+	builder.WriteString("codingman_generated: true\n")
+	builder.WriteString("created_at: ")
+	builder.WriteString(now)
+	builder.WriteString("\n")
+	builder.WriteString("updated_at: ")
+	builder.WriteString(now)
+	builder.WriteString("\n")
 	builder.WriteString("allow_tools: []\n")
 	builder.WriteString("context: fork\n")
 	builder.WriteString("---\n\n")
 	builder.WriteString(content)
 	builder.WriteString("\n")
 	return builder.String()
+}
+
+func ensureGeneratedSkillFrontmatter(content string, now string) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) < 2 || strings.TrimSpace(lines[0]) != "---" {
+		return content
+	}
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return content
+	}
+	frontmatter := strings.Join(lines[1:end], "\n")
+	insert := []string{}
+	if !strings.Contains(frontmatter, "codingman_generated:") {
+		insert = append(insert, "codingman_generated: true")
+	}
+	if !strings.Contains(frontmatter, "created_at:") {
+		insert = append(insert, "created_at: "+now)
+	}
+	if strings.Contains(frontmatter, "updated_at:") {
+		for i := 1; i < end; i++ {
+			if strings.HasPrefix(strings.TrimSpace(lines[i]), "updated_at:") {
+				lines[i] = "updated_at: " + now
+				break
+			}
+		}
+	} else {
+		insert = append(insert, "updated_at: "+now)
+	}
+	if len(insert) == 0 {
+		return strings.Join(lines, "\n")
+	}
+	updated := make([]string, 0, len(lines)+len(insert))
+	updated = append(updated, lines[:end]...)
+	updated = append(updated, insert...)
+	updated = append(updated, lines[end:]...)
+	return strings.Join(updated, "\n")
 }
 
 var invalidSkillNameChars = regexp.MustCompile(`[^a-z0-9._-]+`)

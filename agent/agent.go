@@ -55,8 +55,11 @@ type Agent struct {
 	contextConfig             ContextConfig
 	skills                    []Skill
 	activeSkill               string
+	activeSkillContent        string
+	activeSkillAuto           bool
 	skillAllowedTools         map[string]struct{}
 	skillToolRestriction      bool
+	skillEvictionConfig       SkillEvictionConfig
 	retryConfig               RetryConfig
 	permission                *PermissionManager
 	promptCache               PromptCacheConfig
@@ -72,6 +75,7 @@ type Agent struct {
 	nextChildIndex            atomic.Uint64
 	maxSubAgentDepth          int
 	enableSelfReflection      bool
+	eventSink                 func(AgentEvent)
 }
 
 type AgentConfig struct {
@@ -111,6 +115,32 @@ type AgentConfig struct {
 	Depth                    int
 	MaxSubAgentDepth         int
 	EnableSelfReflection     *bool
+	SkillEviction            SkillEvictionConfig
+	EventSink                func(AgentEvent)
+}
+
+type AgentEventType string
+
+const (
+	AgentEventSkillSelected AgentEventType = "skill_selected"
+	AgentEventFileDiff      AgentEventType = "file_diff"
+)
+
+type AgentEvent struct {
+	Type          AgentEventType
+	SkillSelected *SkillSelectedEvent
+	FileDiff      *FileDiffEvent
+}
+
+type SkillSelectedEvent struct {
+	Skill  Skill
+	Reason string
+	Auto   bool
+}
+
+type FileDiffEvent struct {
+	Path string
+	Diff string
 }
 
 type ToolBudget struct {
@@ -240,6 +270,7 @@ func NewAgent(config AgentConfig) *Agent {
 		autoCompactKeepRecent:    defaultAutoCompactKeepRecent(contextConfig.KeepRecentRounds),
 		contextConfig:            contextConfig,
 		skills:                   loadedSkills,
+		skillEvictionConfig:      normalizeSkillEvictionConfig(config.SkillEviction),
 		retryConfig:              defaultRetryConfig(config.RetryConfig),
 		permission:               permissionManager,
 		promptCache:              normalizePromptCacheConfig(promptCacheConfig),
@@ -252,12 +283,16 @@ func NewAgent(config AgentConfig) *Agent {
 		mcp:                      mcpManager,
 		maxSubAgentDepth:         defaultPositiveInt(config.MaxSubAgentDepth, defaultMaxSubAgentDepth),
 		enableSelfReflection:     defaultBool(config.EnableSelfReflection, true),
+		eventSink:                config.EventSink,
 	}
 	if mcpManager != nil {
 		agent.cleanup = append(agent.cleanup, mcpManager.Close)
 		mcpManager.Start(context.Background(), agent.registry)
 	}
 	agent.a2a.RegisterAgent(agent.id, agent.parentID)
+	if _, err := agent.MaybeEvictGeneratedSkills(time.Now().UTC()); err != nil {
+		agent.log("", "skill_eviction startup_error=%v", err)
+	}
 	agent.coordinator = NewCoordinator(agent, config.Coordination)
 	agent.registerInternalTools()
 	agent.startCrossSessionMemoryWorker()
@@ -389,6 +424,21 @@ func (agent *Agent) SetLogger(logger Logger) {
 	}
 }
 
+func (agent *Agent) SetEventSink(sink func(AgentEvent)) {
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	agent.eventSink = sink
+}
+
+func (agent *Agent) emitEvent(event AgentEvent) {
+	agent.mu.Lock()
+	sink := agent.eventSink
+	agent.mu.Unlock()
+	if sink != nil {
+		sink(event)
+	}
+}
+
 func (agent *Agent) log(traceID string, format string, args ...any) {
 	agent.mu.Lock()
 	logger := agent.logger
@@ -506,9 +556,15 @@ func (agent *Agent) RunToolLoop(ctx context.Context, prompt string, blocks ...Co
 	ctx, traceID := ensureTrace(ctx)
 	defer func() {
 		agent.runHooks(ctx, HookPayload{Event: HookEventStop, AgentID: agent.ID(), TraceID: traceID, Message: "tool loop stopped"})
+		if _, err := agent.MaybeEvictGeneratedSkills(time.Now().UTC()); err != nil {
+			agent.log(traceID, "skill_eviction task_error=%v", err)
+		}
 	}()
 	agent.log(traceID, "tool_loop start prompt_chars=%d blocks=%d", len(prompt), len(blocks))
 	agent.log(traceID, "user message:\n%s", formatContentForLog(prompt, blocks))
+	if _, _, err := agent.AutoSelectSkillForPrompt(ctx, prompt, blocks...); err != nil {
+		agent.log(traceID, "tool_loop skill_autoload error=%v", err)
+	}
 	if err := agent.appendUserMessage(prompt, blocks...); err != nil {
 		agent.log(traceID, "tool_loop append_user error=%v", err)
 		return LLMResponse{}, err
@@ -813,14 +869,22 @@ func (agent *Agent) SetActiveSkill(name string) error {
 		return errors.New("skill name must not be empty")
 	}
 	agent.mu.Lock()
-	defer agent.mu.Unlock()
 	for _, skill := range agent.skills {
 		if skill.Name == name {
 			agent.activeSkill = skill.Name
+			agent.activeSkillContent = fullSkillContent(skill)
+			agent.activeSkillAuto = false
 			agent.skillAllowedTools, agent.skillToolRestriction = skillToolAllowlist(skill)
+			agent.mu.Unlock()
+			if skill.UserLevel {
+				if err := recordSkillUsage(skill, time.Now()); err != nil {
+					agent.log("", "skill_usage manual_error=%v", err)
+				}
+			}
 			return nil
 		}
 	}
+	agent.mu.Unlock()
 	return fmt.Errorf("skill %q not found", name)
 }
 
@@ -828,6 +892,8 @@ func (agent *Agent) ClearActiveSkill() {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	agent.activeSkill = ""
+	agent.activeSkillContent = ""
+	agent.activeSkillAuto = false
 	agent.skillAllowedTools = nil
 	agent.skillToolRestriction = false
 }
@@ -840,11 +906,16 @@ func (agent *Agent) refreshActiveSkillLocked() {
 	}
 	for _, skill := range agent.skills {
 		if skill.Name == agent.activeSkill {
+			if agent.activeSkillContent == "" {
+				agent.activeSkillContent = fullSkillContent(skill)
+			}
 			agent.skillAllowedTools, agent.skillToolRestriction = skillToolAllowlist(skill)
 			return
 		}
 	}
 	agent.activeSkill = ""
+	agent.activeSkillContent = ""
+	agent.activeSkillAuto = false
 }
 
 func (agent *Agent) SetBaseSystemPrompt(baseSystem string) error {
@@ -1217,6 +1288,14 @@ func (agent *Agent) SessionMemory() []SessionMemoryEntry {
 
 func (agent *Agent) systemWithSessionMemoryLocked() string {
 	system := agent.system
+	if strings.TrimSpace(agent.activeSkillContent) != "" {
+		var builder strings.Builder
+		builder.WriteString(system)
+		builder.WriteString("\n\n## Active Skill\n")
+		builder.WriteString(agent.activeSkillContent)
+		builder.WriteString("\n")
+		system = builder.String()
+	}
 	if len(agent.sessionMemory) == 0 {
 		return system
 	}
@@ -1854,6 +1933,11 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 
 func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution, result *ToolResult) {
 	traceID := prepared.traceID
+	var before fileSnapshot
+	trackDiff := prepared.name == "write" || prepared.name == "edit"
+	if trackDiff {
+		before = captureFileSnapshot(prepared.input)
+	}
 	if updated := agent.runHooks(prepared.ctx, HookPayload{
 		Event:     HookEventPreToolUse,
 		AgentID:   agent.ID(),
@@ -1865,6 +1949,9 @@ func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution
 		prepared.input = updated
 		prepared.toolUse.Input = mustMarshalToolInput(updated)
 		result.ToolUse = prepared.toolUse
+		if trackDiff {
+			before = captureFileSnapshot(prepared.input)
+		}
 	}
 	content, err := agent.callPreparedTool(prepared)
 	agent.RecordToolCall(prepared.name)
@@ -1888,6 +1975,9 @@ func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution
 	}
 	result.Content = content
 	result.IsError = false
+	if trackDiff {
+		agent.emitFileDiff(prepared.input, before)
+	}
 	agent.log(traceID, "tool_execute success name=%s id=%s result_chars=%d", prepared.name, prepared.toolUse.ID, len(content))
 	agent.runHooks(prepared.ctx, HookPayload{
 		Event:     HookEventPostToolUse,
@@ -1898,6 +1988,25 @@ func (agent *Agent) executePreparedToolIntoResult(prepared preparedToolExecution
 		Input:     prepared.input,
 		Output:    content,
 	})
+}
+
+func (agent *Agent) emitFileDiff(input map[string]any, before fileSnapshot) {
+	after := captureFileSnapshot(input)
+	if after.path == "" {
+		return
+	}
+	path := after.path
+	if before.path != "" {
+		path = before.path
+	}
+	diff := unifiedFileDiff(path, before.content, after.content)
+	if strings.TrimSpace(diff) == "" {
+		return
+	}
+	agent.emitEvent(AgentEvent{Type: AgentEventFileDiff, FileDiff: &FileDiffEvent{
+		Path: path,
+		Diff: diff,
+	}})
 }
 
 func (agent *Agent) runHooks(ctx context.Context, payload HookPayload) HookResult {

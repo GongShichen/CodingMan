@@ -41,11 +41,11 @@ go vet ./...
 
 - **TUI 入口**：`main.go` 是启动入口，支持普通对话、plan mode、ESC 中断、图片输入和 slash commands。
 - **Provider**：支持 OpenAI-compatible 和 Anthropic-compatible 模型接口；第三方 API 通过 `BASE_URL` 接入。
-- **工具系统**：内置 `read`、`write`、`edit`、`grep`、`glob`、`bash`，并支持并行安全分批执行。
+- **工具系统**：内置 `read`、`write`、`edit`、`grep`、`glob`、`bash`，并支持并行安全分批执行；`write` / `edit` 成功后会在 TUI 中显示文件 diff。
 - **权限系统**：支持 `ask`、`allow-deny`、`full-auto` 三种模式；只读工具和安全 bash 命令可默认并行。
 - **上下文系统**：加载系统提示词、项目记忆、SKILL、会话记忆、跨会话记忆，并支持自动压缩。
-- **SKILL 系统**：支持用户级和项目级 SKILL，项目级同名覆盖用户级；可通过 `/skill use <name>` 激活运行时工具白名单。
-- **记忆自我进化**：复杂任务后自动审查对话，将可复用经验沉淀为用户级 SKILL。
+- **SKILL 系统**：支持用户级和项目级 SKILL，项目级同名覆盖用户级；每次真实执行前会用 LLM 从用户级 SKILL 中自动选择可用 SKILL，也可通过 `/skill use <name>` 手动激活运行时工具白名单。
+- **记忆自我进化**：复杂任务后自动审查对话，将可复用经验沉淀为用户级 SKILL；Agent 自沉淀的低频旧 SKILL 会按保守 LRU 策略淘汰。
 - **MCP Client**：支持 stdio、SSE、HTTP、WebSocket 传输，提供 MCP tools 和 resources 访问。
 - **Hooks**：支持 `http`、`shell`、`function`、`log` 类型 Hook，覆盖工具调用和 Agent 生命周期事件。
 - **子 Agent / A2A**：主 Agent ID 默认为 `main`，可启动直接子 Agent，支持 fork/worker 模式、异步任务和中止。
@@ -83,6 +83,10 @@ MAX_CONCURRENT_SUB_AGENTS=4
 
 SESSION_MEMORY_TOOL_THRESHOLD=10
 SKILL_EVOLUTION_TOOL_THRESHOLD=10
+SKILL_EVICTION_ENABLED=true
+SKILL_EVICTION_UNUSED_DAYS=90
+SKILL_EVICTION_MIN_USES=3
+SKILL_EVICTION_CHECK_INTERVAL_HOURS=24
 SESSION_MEMORY_MAX_ENTRIES=8
 SESSION_MEMORY_MAX_CHARS=8000
 CROSS_SESSION_MEMORY_MAX_CHARS=12000
@@ -174,6 +178,9 @@ name: go-testing
 description: Go test debugging workflow
 allow_tools: [read, grep, bash, edit]
 context: fork
+codingman_generated: false
+created_at: 2026-04-29T00:00:00Z
+updated_at: 2026-04-29T00:00:00Z
 ---
 
 # Go Testing
@@ -187,8 +194,39 @@ Describe the reusable workflow here.
 - `description`：一句话描述。
 - `allow_tools`：激活该 SKILL 后 Agent 可用工具白名单；不写表示所有工具。
 - `context`：`fork` 或 `inline`，默认 `fork`。
+- `codingman_generated`：是否由 Agent 自我沉淀生成。未写或为 `false` 时视为用户主动添加，不会被自动淘汰。
+- `created_at` / `updated_at`：可选时间戳，用于自沉淀 SKILL 的保守淘汰判断。
+
+真实执行进入 `RunToolLoop` 前，Agent 会扫描用户级 SKILL，并让当前 LLM 按任务内容选择最多一个相关 SKILL。自动选中的 SKILL 会完整注入当前轮 system prompt 的 `## Active Skill`，TUI 会显示：
+
+```text
+using skill: go-testing - Go test debugging workflow
+```
+
+如果已经通过 `/skill use <name>` 手动激活 SKILL，则手动选择优先，自动选择不会覆盖。
 
 当工具调用次数达到 `SKILL_EVOLUTION_TOOL_THRESHOLD` 后，Agent 会在后台审查对话，将值得长期复用的经验写成用户级 SKILL。
+
+自沉淀 SKILL 会写入 `codingman_generated: true`，并在以下文件记录使用次数和最近使用时间：
+
+```text
+~/.codingman/skills/.codingman_usage.json
+```
+
+默认淘汰策略只处理 `codingman_generated: true` 的用户级 SKILL：超过 90 天未使用且累计使用少于 3 次才会删除；项目级 SKILL、用户手动添加的 SKILL、未标记的历史 SKILL 都不会被淘汰。
+
+## 文件 Diff
+
+`write` 和 `edit` 工具成功修改文件后，TUI 会立即显示简洁 unified diff：
+
+```diff
+--- path/to/file.go
++++ path/to/file.go
+-old line
++new line
+```
+
+失败的工具调用不会显示 diff。该能力用于让用户在 agent loop 中直接看到增删改，不改变工具返回给模型的内容。
 
 ## MCP 与 Hooks
 

@@ -414,6 +414,226 @@ func TestSkillEvolutionParsesNoisyJSONAndExecuteToolsTriggersReview(t *testing.T
 	}
 }
 
+func TestAutoSelectSkillInjectsUserSkillAndRecordsUsage(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+	writeFile(t, filepath.Join(home, ".codingman", "skills", "go-test", "SKILL.md"), "---\nname: go-test\ndescription: Go test workflow\nallow_tools: [echo]\ncontext: fork\n---\n\nRun focused go tests before editing.\n")
+	var sawActiveSkill bool
+	llm := &fakeLLM{
+		chatFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {
+			return agent.LLMResponse{Content: `{"skill":"go-test","reason":"matches go test task"}`, StopReason: "completed"}, nil
+		},
+		streamFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+			if opts.System == nil || !strings.Contains(*opts.System, "## Active Skill") || !strings.Contains(*opts.System, "Run focused go tests") {
+				t.Fatalf("active skill missing from system:\n%v", opts.System)
+			}
+			sawActiveSkill = true
+			return []agent.StreamEvent{{Type: "text", Text: "ok"}, {Done: true}}
+		},
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Context: agent.ContextConfig{
+			Cwd:         project,
+			ProjectRoot: project,
+			BaseSystem:  "base",
+			LoadSkills:  true,
+		},
+		Permission: agent.PermissionConfig{Mode: agent.PermissionModeFullAuto},
+	})
+	var selected string
+	a.SetEventSink(func(event agent.AgentEvent) {
+		if event.Type == agent.AgentEventSkillSelected && event.SkillSelected != nil {
+			selected = event.SkillSelected.Skill.Name
+		}
+	})
+	if _, err := a.RunToolLoop(context.Background(), "fix go test"); err != nil {
+		t.Fatal(err)
+	}
+	if !sawActiveSkill || selected != "go-test" {
+		t.Fatalf("skill was not selected/injected, selected=%q saw=%v", selected, sawActiveSkill)
+	}
+	usagePath := filepath.Join(home, ".codingman", "skills", ".codingman_usage.json")
+	data, err := os.ReadFile(usagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"use_count": 1`) || !strings.Contains(string(data), "go-test") {
+		t.Fatalf("usage was not recorded:\n%s", string(data))
+	}
+}
+
+func TestManualSkillTakesPrecedenceOverAutoSelect(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+	writeFile(t, filepath.Join(home, ".codingman", "skills", "manual", "SKILL.md"), "---\nname: manual\ndescription: manual skill\nallow_tools: []\ncontext: fork\n---\n\nmanual body\n")
+	writeFile(t, filepath.Join(home, ".codingman", "skills", "auto", "SKILL.md"), "---\nname: auto\ndescription: auto skill\nallow_tools: []\ncontext: fork\n---\n\nauto body\n")
+	var chatCalls atomic.Int64
+	llm := &fakeLLM{
+		chatFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {
+			chatCalls.Add(1)
+			return agent.LLMResponse{Content: `{"skill":"auto","reason":"would match"}`, StopReason: "completed"}, nil
+		},
+		streamFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+			if opts.System == nil || !strings.Contains(*opts.System, "manual body") || strings.Contains(*opts.System, "## Active Skill\nauto body") {
+				t.Fatalf("manual active skill did not take precedence:\n%v", opts.System)
+			}
+			return []agent.StreamEvent{{Type: "text", Text: "ok"}, {Done: true}}
+		},
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Context: agent.ContextConfig{
+			Cwd:         project,
+			ProjectRoot: project,
+			BaseSystem:  "base",
+			LoadSkills:  true,
+		},
+		Permission: agent.PermissionConfig{Mode: agent.PermissionModeFullAuto},
+	})
+	if err := a.SetActiveSkill("manual"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.RunToolLoop(context.Background(), "use a skill"); err != nil {
+		t.Fatal(err)
+	}
+	if chatCalls.Load() != 0 {
+		t.Fatalf("auto selector should not call llm when manual skill is active")
+	}
+}
+
+func TestInvalidAutoSkillSelectionDoesNotBlockExecution(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+	writeFile(t, filepath.Join(home, ".codingman", "skills", "docs", "SKILL.md"), "---\nname: docs\ndescription: docs\ncontext: fork\n---\n\ndocs body\n")
+	llm := &fakeLLM{
+		chatFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions) (agent.LLMResponse, error) {
+			return agent.LLMResponse{Content: `not json`, StopReason: "completed"}, nil
+		},
+		streamFn: func(ctx context.Context, messages []agent.Message, opts agent.ChatOptions, call int) []agent.StreamEvent {
+			if opts.System != nil && strings.Contains(*opts.System, "## Active Skill") {
+				t.Fatalf("invalid selection should not inject active skill:\n%s", *opts.System)
+			}
+			return []agent.StreamEvent{{Type: "text", Text: "ok"}, {Done: true}}
+		},
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: llm,
+		Context: agent.ContextConfig{
+			Cwd:         project,
+			ProjectRoot: project,
+			BaseSystem:  "base",
+			LoadSkills:  true,
+		},
+		Permission: agent.PermissionConfig{Mode: agent.PermissionModeFullAuto},
+	})
+	if _, err := a.RunToolLoop(context.Background(), "write docs"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSkillEvictionOnlyRemovesOldLowUseGeneratedUserSkills(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+	old := time.Now().AddDate(0, 0, -120).UTC().Format(time.RFC3339)
+	writeFile(t, filepath.Join(home, ".codingman", "skills", "generated-old", "SKILL.md"), "---\nname: generated-old\ndescription: old generated\ncodingman_generated: true\ncreated_at: "+old+"\nupdated_at: "+old+"\ncontext: fork\n---\n\nold\n")
+	writeFile(t, filepath.Join(home, ".codingman", "skills", "manual-old", "SKILL.md"), "---\nname: manual-old\ndescription: manual\ncreated_at: "+old+"\nupdated_at: "+old+"\ncontext: fork\n---\n\nmanual\n")
+	writeFile(t, filepath.Join(project, ".codingman", "skills", "project-generated", "SKILL.md"), "---\nname: project-generated\ndescription: project\ncodingman_generated: true\ncreated_at: "+old+"\nupdated_at: "+old+"\ncontext: fork\n---\n\nproject\n")
+	writeFile(t, filepath.Join(home, ".codingman", "skills", ".codingman_usage.json"), `{"last_eviction_check_at":"`+time.Now().UTC().Format(time.RFC3339)+`","skills":{}}`+"\n")
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM: &fakeLLM{},
+		Context: agent.ContextConfig{
+			Cwd:         project,
+			ProjectRoot: project,
+			BaseSystem:  "base",
+			LoadSkills:  true,
+		},
+		SkillEviction: agent.SkillEvictionConfig{Enabled: true, UnusedDays: 90, MinUses: 3, CheckIntervalHours: 1},
+	})
+	result, err := a.MaybeEvictGeneratedSkills(time.Now().UTC().Add(2 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Evicted) != 1 || result.Evicted[0] != "generated-old" {
+		t.Fatalf("unexpected evictions: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codingman", "skills", "generated-old")); !os.IsNotExist(err) {
+		t.Fatalf("generated old skill should be deleted, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codingman", "skills", "manual-old", "SKILL.md")); err != nil {
+		t.Fatalf("manual skill must remain: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(project, ".codingman", "skills", "project-generated", "SKILL.md")); err != nil {
+		t.Fatalf("project skill must remain: %v", err)
+	}
+}
+
+func TestWriteAndEditEmitDiffEvents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file.txt")
+	registry := tool.NewRegistry()
+	if err := registry.Register(tool.NewWriteTool()); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(tool.NewEditTool()); err != nil {
+		t.Fatal(err)
+	}
+	a := agent.NewAgent(agent.AgentConfig{
+		LLM:      &fakeLLM{},
+		Registry: registry,
+		Permission: agent.PermissionConfig{
+			Mode:         agent.PermissionModeAllowDeny,
+			AllowedTools: []string{"write", "edit"},
+		},
+	})
+	var diffs []string
+	a.SetEventSink(func(event agent.AgentEvent) {
+		if event.Type == agent.AgentEventFileDiff && event.FileDiff != nil {
+			diffs = append(diffs, event.FileDiff.Diff)
+		}
+	})
+	if _, err := a.ExecuteTool(context.Background(), map[string]any{
+		"name":      "write",
+		"arguments": fmt.Sprintf(`{"filePath":%q,"content":"alpha\nbeta\n"}`, path),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(diffs) != 1 || !strings.Contains(diffs[0], "+alpha") || !strings.Contains(diffs[0], "+beta") {
+		t.Fatalf("write diff missing additions: %+v", diffs)
+	}
+	if _, err := a.ExecuteTool(context.Background(), map[string]any{
+		"name":      "write",
+		"arguments": fmt.Sprintf(`{"filePath":%q,"content":"alpha\nbeta2\n","overwrite":true}`, path),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(diffs) != 2 || !strings.Contains(diffs[1], "-beta") || !strings.Contains(diffs[1], "+beta2") {
+		t.Fatalf("overwrite diff missing changes: %+v", diffs)
+	}
+	if _, err := a.ExecuteTool(context.Background(), map[string]any{
+		"name":      "edit",
+		"arguments": fmt.Sprintf(`{"filePath":%q,"oldText":"beta2","newText":"gamma"}`, path),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(diffs) != 3 || !strings.Contains(diffs[2], "-beta2") || !strings.Contains(diffs[2], "+gamma") {
+		t.Fatalf("edit diff missing changes: %+v", diffs)
+	}
+	if _, err := a.ExecuteTool(context.Background(), map[string]any{
+		"name":      "edit",
+		"arguments": fmt.Sprintf(`{"filePath":%q,"oldText":"missing","newText":"noop"}`, path),
+	}); err == nil {
+		t.Fatal("expected failed edit")
+	}
+	if len(diffs) != 3 {
+		t.Fatalf("failed edit should not emit diff: %+v", diffs)
+	}
+}
+
 func waitForCondition(t *testing.T, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
