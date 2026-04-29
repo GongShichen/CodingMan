@@ -41,7 +41,7 @@ type PermissionConfig struct {
 func DefaultPermissionConfig() PermissionConfig {
 	return PermissionConfig{
 		Mode:                    PermissionModeAsk,
-		AllowedTools:            []string{"read", "grep", "glob"},
+		AllowedTools:            []string{"read", "grep", "glob", "websearch"},
 		AllowedReadOnlyCommands: []string{"pwd", "ls", "find", "rg", "grep", "cat", "sed", "head", "tail", "wc", "sort", "git status", "git diff", "git log", "git show"},
 	}
 }
@@ -181,7 +181,7 @@ func isParallelSafeRequest(request PermissionRequest, toolAllowed bool, allowedC
 		return isAllowedBashCommand(request.ToolInput, allowedCommands) ||
 			isReadOnlyBashCommand(request.ToolInput, readonlyCommands)
 	}
-	return request.ToolName == "read" || request.ToolName == "grep" || request.ToolName == "glob"
+	return request.ToolName == "read" || request.ToolName == "grep" || request.ToolName == "glob" || request.ToolName == "websearch"
 }
 
 func (manager *PermissionManager) isToolAllowedLocked(name string) bool {

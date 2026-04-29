@@ -41,7 +41,7 @@ go vet ./...
 
 - **TUI 入口**：`main.go` 是启动入口，支持普通对话、plan mode、ESC 中断、图片输入和 slash commands。
 - **Provider**：支持 OpenAI-compatible 和 Anthropic-compatible 模型接口；第三方 API 通过 `BASE_URL` 接入。
-- **工具系统**：内置 `read`、`write`、`edit`、`grep`、`glob`、`bash`，并支持并行安全分批执行；`write` / `edit` 成功后会在 TUI 中显示文件 diff。
+- **工具系统**：内置 `read`、`write`、`edit`、`grep`、`glob`、`bash`、`websearch`，并支持并行安全分批执行；`write` / `edit` 成功后会在 TUI 中显示文件 diff。
 - **权限系统**：支持 `ask`、`allow-deny`、`full-auto` 三种模式；只读工具和安全 bash 命令可默认并行。
 - **上下文系统**：加载系统提示词、项目记忆、SKILL、会话记忆、跨会话记忆，并支持自动压缩。
 - **SKILL 系统**：支持用户级和项目级 SKILL，项目级同名覆盖用户级；每次真实执行前会用 LLM 从用户级 SKILL 中自动选择可用 SKILL，也可通过 `/skill use <name>` 手动激活运行时工具白名单。

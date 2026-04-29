@@ -9,5 +9,6 @@ func NewDefaultRegistry() *Registry {
 	_ = registry.Register(NewEditTool())
 	_ = registry.Register(NewGlobTool())
 	_ = registry.Register(NewGrepTool())
+	_ = registry.Register(NewWebSearchTool())
 	return registry
 }
