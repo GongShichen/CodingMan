@@ -2065,7 +2065,14 @@ func (agent *Agent) runHooks(ctx context.Context, payload HookPayload) HookResul
 	if hooks == nil {
 		return HookResult{}
 	}
+	matched := hooks.MatchingCount(payload)
+	if matched == 0 {
+		return HookResult{}
+	}
+	started := time.Now()
+	agent.log(payload.TraceID, "hook_run start event=%s tool=%s matched=%d", payload.Event, payload.ToolName, matched)
 	result := hooks.Run(ctx, payload)
+	agent.log(payload.TraceID, "hook_run completed event=%s tool=%s matched=%d duration_ms=%d updated_input=%v message_chars=%d", payload.Event, payload.ToolName, matched, time.Since(started).Milliseconds(), result.UpdatedInput != nil, len(result.Message))
 	if result.Message != "" {
 		agent.log(payload.TraceID, "hook message event=%s tool=%s:\n%s", payload.Event, payload.ToolName, result.Message)
 	}

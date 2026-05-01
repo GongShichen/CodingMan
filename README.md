@@ -231,33 +231,28 @@ using skill: go-testing - Go test debugging workflow
 
 ## macOS 沙箱
 
-沙箱暂时只支持 macOS arm64 + vfkit。首次启动会创建 `~/.codingman/sandbox/config`；之后每次 TUI 启动都会检查沙箱环境。若缺少 vfkit、VM MCP Server、cloud-init 配置或 Debian 12 slim arm64 raw 镜像，会说明必要性并询问是否安装/构建，用户确认后才执行。默认 `SANDBOX_ENABLED=auto` 表示 `permission=ask` 时启用；`full-auto` 会关闭沙箱，并要求显式确认风险。
+沙箱暂时只支持 macOS arm64 + Apple Virtualization Framework / vfkit，不依赖 Docker。默认 `SANDBOX_ENABLED=auto`，在 `permission=ask` 模式下启用；`full-auto` 不启动沙箱，并会提示本地执行风险。
 
-也可以手动构建 VM 内 MCP Server 与 rootfs：
+首次启动会创建 `~/.codingman/sandbox/config`，并在 TUI 中检查 vfkit、Debian 12 slim 镜像、VM MCP Server 等依赖。缺少依赖时会询问是否安装，并显示配置进度；从 `full-auto` 切回 `/permission ask` 时也会重新检查沙箱环境。
 
-```bash
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o sandbox/mcp-server-linux-arm64 ./cmd/sandbox-mcp-server
-SANDBOX_ROOTFS=$PWD/sandbox/debian-12-slim-arm64.raw ./sandbox/build-rootfs.sh
+`ask` 模式下，bash 写入/变更类命令、`write`、`edit`、危险 `curl`、直接执行 Python/Node 脚本等操作会进入 Debian 12 slim VM 执行。只读 `read` / `grep` / `glob` / `websearch` 默认仍走本地。启动 CodingMan 的目录会挂载到 VM，并提供 `/workspace` 路径。
+
+常用配置：
+
+```text
+~/.codingman/sandbox/config
+~/.codingman/sandbox/debian-12-slim-arm64.raw
 ```
-
-运行时配置：
 
 ```env
 SANDBOX_ENABLED=auto
-SANDBOX_ROOTFS=/path/to/debian-12-slim-arm64.raw
 SANDBOX_VFKIT=vfkit
 SANDBOX_KEEPALIVE_INTERVAL=30s
-SANDBOX_BOOTSTRAP=auto
-SANDBOX_MCP_SERVER=~/.codingman/sandbox/mcp-server-linux-arm64
-SANDBOX_EFI_VARIABLE_STORE=~/.codingman/sandbox/efi-variable-store
 SANDBOX_ROOTFS_SOURCE=/path/to/pre-downloaded/debian-12-genericcloud-arm64.raw
 DEBIAN_IMAGE_URLS=https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.raw|https://chuangtzu.ftp.acc.umu.se/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.raw
-DEBIAN_SHA512_URLS=https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS|https://chuangtzu.ftp.acc.umu.se/images/cloud/bookworm/latest/SHA512SUMS
 ```
 
-Agent Core 通过本地 TCP proxy 连接 vfkit 暴露的 Unix socket，再经 vsock 到 VM。VM 内 `socat` 监听 vsock 8080 并转发到 `127.0.0.1:8080` 的 Go MCP Server；宿主侧每 30 秒调用 `/health` 保持链路活跃。
-
-`build-rootfs.sh` 会优先复用已有的 `.download` 临时文件并校验 SHA512；下载时按 `aria2c`、`wget`、`curl` 顺序尝试，并在多个 Debian 镜像源之间 fallback。若网络环境无法稳定访问 Debian 镜像源，可以先手动下载 `debian-12-genericcloud-arm64.raw`，再通过 `SANDBOX_ROOTFS_SOURCE` 指向本地文件。
+镜像下载会自动尝试多个 Debian 源；网络不稳定时，可以先手动下载 `debian-12-genericcloud-arm64.raw`，再通过 `SANDBOX_ROOTFS_SOURCE` 指向本地文件。
 
 ## MCP 与 Hooks
 

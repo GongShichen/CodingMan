@@ -127,6 +127,21 @@ func (manager *HookManager) RegisterFunction(name string, fn HookFunc) {
 	manager.functions[strings.TrimSpace(name)] = fn
 }
 
+func (manager *HookManager) MatchingCount(payload HookPayload) int {
+	if manager == nil {
+		return 0
+	}
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	count := 0
+	for _, hook := range manager.hooks {
+		if hookMatches(hook, payload) {
+			count++
+		}
+	}
+	return count
+}
+
 func (manager *HookManager) Run(ctx context.Context, payload HookPayload) HookResult {
 	if manager == nil {
 		return HookResult{}

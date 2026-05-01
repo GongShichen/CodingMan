@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +62,35 @@ type SandboxManager struct {
 	socketPath string
 	closed     chan struct{}
 	startErr   error
+}
+
+type sandboxLogWriter struct {
+	mu      sync.Mutex
+	logger  Logger
+	traceID string
+	prefix  string
+	buffer  []byte
+}
+
+func (writer *sandboxLogWriter) Write(data []byte) (int, error) {
+	if writer == nil || writer.logger == nil {
+		return len(data), nil
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	writer.buffer = append(writer.buffer, data...)
+	for {
+		index := bytes.IndexByte(writer.buffer, '\n')
+		if index < 0 {
+			break
+		}
+		line := strings.TrimSpace(string(writer.buffer[:index]))
+		writer.buffer = writer.buffer[index+1:]
+		if line != "" {
+			writer.logger.Log(writer.traceID, "%s %s", writer.prefix, line)
+		}
+	}
+	return len(data), nil
 }
 
 type SandboxUnavailableError struct {
@@ -143,36 +173,45 @@ func (sandbox *SandboxManager) Start(ctx context.Context) error {
 	if sandbox == nil {
 		return SandboxUnavailableError{Reason: "manager is nil"}
 	}
+	traceID := TraceIDFromContext(ctx)
 	sandbox.mu.Lock()
 	defer sandbox.mu.Unlock()
 	if sandbox.tcpAddr != "" {
 		return nil
 	}
+	sandbox.logger.Log(traceID, "sandbox_start begin rootfs=%s vfkit=%s cwd=%s", sandbox.config.RootFS, sandbox.config.VFKitPath, sandbox.cwd)
 	if sandbox.config.Enabled == SandboxEnabledFalse {
 		sandbox.startErr = SandboxUnavailableError{Reason: "disabled by configuration"}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	}
 	if runtime.GOOS != "darwin" {
 		sandbox.startErr = SandboxUnavailableError{Reason: "only macOS is supported"}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	}
 	if strings.TrimSpace(sandbox.config.RootFS) == "" {
 		sandbox.startErr = SandboxUnavailableError{Reason: "SANDBOX_ROOTFS is not configured"}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	}
 	if info, err := os.Stat(sandbox.config.RootFS); err != nil {
 		sandbox.startErr = SandboxUnavailableError{Reason: "SANDBOX_ROOTFS not found: " + err.Error()}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	} else if info.IsDir() {
 		sandbox.startErr = SandboxUnavailableError{Reason: "SANDBOX_ROOTFS must be a bootable raw disk image, got directory: " + sandbox.config.RootFS}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	}
 	if _, err := exec.LookPath(sandbox.config.VFKitPath); err != nil {
 		sandbox.startErr = SandboxUnavailableError{Reason: "vfkit not found in PATH"}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	}
 	if err := sandbox.prepareHostShare(); err != nil {
 		sandbox.startErr = SandboxUnavailableError{Reason: err.Error()}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	}
 	socketPath := sandbox.config.SocketPath
@@ -183,6 +222,7 @@ func (sandbox *SandboxManager) Start(ctx context.Context) error {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		sandbox.startErr = SandboxUnavailableError{Reason: err.Error()}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	}
 	sandbox.listener = listener
@@ -191,19 +231,20 @@ func (sandbox *SandboxManager) Start(ctx context.Context) error {
 
 	args := sandbox.vfkitArgs(socketPath)
 	cmd := exec.CommandContext(ctx, sandbox.config.VFKitPath, args...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = &sandboxLogWriter{logger: sandbox.logger, traceID: traceID, prefix: "sandbox_vfkit stdout:"}
+	cmd.Stderr = &sandboxLogWriter{logger: sandbox.logger, traceID: traceID, prefix: "sandbox_vfkit stderr:"}
 	if err := cmd.Start(); err != nil {
 		_ = listener.Close()
 		sandbox.listener = nil
 		sandbox.tcpAddr = ""
 		sandbox.startErr = SandboxUnavailableError{Reason: err.Error()}
+		sandbox.logger.Log(traceID, "sandbox_start unavailable reason=%s", sandbox.startErr)
 		return sandbox.startErr
 	}
 	sandbox.cmd = cmd
 	go sandbox.proxyLoop(listener, socketPath)
 	go sandbox.keepaliveLoop()
-	sandbox.logger.Log(TraceIDFromContext(ctx), "sandbox started tcp=%s socket=%s rootfs=%s", sandbox.tcpAddr, socketPath, sandbox.config.RootFS)
+	sandbox.logger.Log(traceID, "sandbox_start success pid=%d tcp=%s socket=%s rootfs=%s", cmd.Process.Pid, sandbox.tcpAddr, socketPath, sandbox.config.RootFS)
 	return nil
 }
 
@@ -315,6 +356,7 @@ func (sandbox *SandboxManager) Close() error {
 		_ = sandbox.listener.Close()
 	}
 	if sandbox.cmd != nil && sandbox.cmd.Process != nil {
+		sandbox.logger.Log("", "sandbox_close killing pid=%d", sandbox.cmd.Process.Pid)
 		_ = sandbox.cmd.Process.Kill()
 	}
 	if sandbox.socketPath != "" {
@@ -347,6 +389,7 @@ func (sandbox *SandboxManager) proxyConn(client net.Conn, socketPath string) {
 	defer client.Close()
 	server, err := net.Dial("unix", socketPath)
 	if err != nil {
+		sandbox.logger.Log("", "sandbox_proxy dial_error socket=%s error=%v", socketPath, err)
 		return
 	}
 	defer server.Close()
@@ -369,7 +412,9 @@ func (sandbox *SandboxManager) keepaliveLoop() {
 		select {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = sandbox.Health(ctx)
+			if err := sandbox.Health(ctx); err != nil {
+				sandbox.logger.Log("", "sandbox_keepalive health_error=%v", err)
+			}
 			cancel()
 		case <-sandbox.closed:
 			return
@@ -410,30 +455,53 @@ func (sandbox *SandboxManager) addr() (string, error) {
 }
 
 func (sandbox *SandboxManager) CallTool(ctx context.Context, name string, input map[string]any) (string, error) {
+	traceID := TraceIDFromContext(ctx)
+	started := time.Now()
+	sandbox.logger.Log(traceID, "sandbox_tool start host_tool=%s", name)
 	if err := sandbox.Start(ctx); err != nil {
+		sandbox.logger.Log(traceID, "sandbox_tool start_error host_tool=%s duration_ms=%d error=%v", name, time.Since(started).Milliseconds(), err)
 		return "", err
 	}
+	readyStarted := time.Now()
 	if err := sandbox.WaitUntilReady(ctx); err != nil {
+		sandbox.logger.Log(traceID, "sandbox_tool ready_error host_tool=%s duration_ms=%d error=%v", name, time.Since(readyStarted).Milliseconds(), err)
 		return "", SandboxUnavailableError{Reason: "health check failed: " + err.Error()}
 	}
+	sandbox.logger.Log(traceID, "sandbox_tool ready host_tool=%s duration_ms=%d", name, time.Since(readyStarted).Milliseconds())
+	var (
+		result  string
+		err     error
+		vmTool  string
+		vmInput map[string]any
+	)
 	switch name {
 	case "bash":
-		return sandbox.callMCPTool(ctx, "bash_execute", input)
+		vmTool = "bash_execute"
+		vmInput = input
 	case "write":
-		return sandbox.callMCPTool(ctx, "file_write", map[string]any{
+		vmTool = "file_write"
+		vmInput = map[string]any{
 			"path":      stringValue(input, "filePath", "file_path", "path"),
 			"content":   input["content"],
 			"overwrite": input["overwrite"],
-		})
+		}
 	case "edit":
-		return sandbox.callMCPTool(ctx, "bash_execute", map[string]any{
+		vmTool = "bash_execute"
+		vmInput = map[string]any{
 			"command": sandboxEditCommand(input),
 			"cwd":     sandbox.cwd,
 			"timeout": input["timeout"],
-		})
+		}
 	default:
 		return "", fmt.Errorf("tool %s is not routed to sandbox", name)
 	}
+	result, err = sandbox.callMCPTool(ctx, vmTool, vmInput)
+	if err != nil {
+		sandbox.logger.Log(traceID, "sandbox_tool error host_tool=%s vm_tool=%s duration_ms=%d output_chars=%d error=%v", name, vmTool, time.Since(started).Milliseconds(), len(result), err)
+		return result, err
+	}
+	sandbox.logger.Log(traceID, "sandbox_tool success host_tool=%s vm_tool=%s duration_ms=%d result_chars=%d", name, vmTool, time.Since(started).Milliseconds(), len(result))
+	return result, nil
 }
 
 func (sandbox *SandboxManager) WaitUntilReady(ctx context.Context) error {
@@ -445,8 +513,11 @@ func (sandbox *SandboxManager) WaitUntilReady(ctx context.Context) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	var lastErr error
+	attempts := 0
 	for {
+		attempts++
 		if err := sandbox.Health(waitCtx); err == nil {
+			sandbox.logger.Log(TraceIDFromContext(ctx), "sandbox_health ready attempts=%d", attempts)
 			return nil
 		} else {
 			lastErr = err
@@ -465,10 +536,13 @@ func (sandbox *SandboxManager) WaitUntilReady(ctx context.Context) error {
 }
 
 func (sandbox *SandboxManager) callMCPTool(ctx context.Context, toolName string, args map[string]any) (string, error) {
+	traceID := TraceIDFromContext(ctx)
 	addr, err := sandbox.addr()
 	if err != nil {
 		return "", err
 	}
+	started := time.Now()
+	sandbox.logger.Log(traceID, "sandbox_mcp call tool=%s addr=%s arg_keys=%s", toolName, addr, strings.Join(mapKeys(args), ","))
 	reqBody := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      time.Now().UnixNano(),
@@ -489,14 +563,17 @@ func (sandbox *SandboxManager) callMCPTool(ctx context.Context, toolName string,
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		sandbox.logger.Log(traceID, "sandbox_mcp transport_error tool=%s duration_ms=%d error=%v", toolName, time.Since(started).Milliseconds(), err)
 		return "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		sandbox.logger.Log(traceID, "sandbox_mcp read_error tool=%s duration_ms=%d error=%v", toolName, time.Since(started).Milliseconds(), err)
 		return "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		sandbox.logger.Log(traceID, "sandbox_mcp status_error tool=%s status=%d duration_ms=%d body_chars=%d", toolName, resp.StatusCode, time.Since(started).Milliseconds(), len(body))
 		return "", fmt.Errorf("sandbox mcp status=%d body=%s", resp.StatusCode, string(body))
 	}
 	var decoded struct {
@@ -504,12 +581,16 @@ func (sandbox *SandboxManager) callMCPTool(ctx context.Context, toolName string,
 		Error  *mcpRPCError    `json:"error"`
 	}
 	if err := json.Unmarshal(body, &decoded); err != nil {
+		sandbox.logger.Log(traceID, "sandbox_mcp decode_error tool=%s duration_ms=%d body_chars=%d error=%v", toolName, time.Since(started).Milliseconds(), len(body), err)
 		return "", err
 	}
 	if decoded.Error != nil {
+		sandbox.logger.Log(traceID, "sandbox_mcp rpc_error tool=%s code=%d duration_ms=%d message=%s", toolName, decoded.Error.Code, time.Since(started).Milliseconds(), decoded.Error.Message)
 		return "", fmt.Errorf("sandbox mcp rpc error %d: %s", decoded.Error.Code, decoded.Error.Message)
 	}
-	return formatMCPToolResult(decoded.Result), nil
+	result := formatMCPToolResult(decoded.Result)
+	sandbox.logger.Log(traceID, "sandbox_mcp success tool=%s status=%d duration_ms=%d result_chars=%d", toolName, resp.StatusCode, time.Since(started).Milliseconds(), len(result))
+	return result, nil
 }
 
 func IsSandboxRequiredToolCall(name string, input map[string]any) bool {
@@ -607,4 +688,13 @@ func stringValue(input map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func mapKeys(input map[string]any) []string {
+	keys := make([]string, 0, len(input))
+	for key := range input {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

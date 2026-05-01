@@ -137,22 +137,25 @@ func (manager *MCPManager) Start(ctx context.Context, registry *tool.Registry) {
 	if manager == nil || registry == nil {
 		return
 	}
+	traceID := TraceIDFromContext(ctx)
 	manager.mu.Lock()
 	clients := make([]*MCPClient, 0, len(manager.clients))
 	for _, client := range manager.clients {
 		clients = append(clients, client)
 	}
 	manager.mu.Unlock()
+	manager.logger.Log(traceID, "mcp start servers=%d", len(clients))
 
 	_ = registry.Register(newListMCPResourcesTool(manager))
 	_ = registry.Register(newReadMCPResourceTool(manager))
 	for _, client := range clients {
 		if err := client.Connect(ctx); err != nil {
-			manager.logger.Log(TraceIDFromContext(ctx), "mcp server=%s connect_error=%v", client.config.Name, err)
+			manager.logger.Log(traceID, "mcp server=%s connect_error=%v", client.config.Name, err)
 			go client.reconnectLoop(ctx, registry)
 			continue
 		}
 		client.registerRemoteTools(registry)
+		manager.logger.Log(traceID, "mcp server=%s connected tools=%d resources=%d", client.config.Name, client.ToolCount(), client.ResourceCount())
 		go client.heartbeatLoop(ctx, registry)
 	}
 }
@@ -179,6 +182,8 @@ func (manager *MCPManager) ListResources(ctx context.Context) ([]MCPResource, er
 	if manager == nil {
 		return nil, nil
 	}
+	traceID := TraceIDFromContext(ctx)
+	started := time.Now()
 	manager.mu.Lock()
 	clients := make([]*MCPClient, 0, len(manager.clients))
 	for _, client := range manager.clients {
@@ -196,8 +201,10 @@ func (manager *MCPManager) ListResources(ctx context.Context) ([]MCPResource, er
 		resources = append(resources, list...)
 	}
 	if len(errs) > 0 {
+		manager.logger.Log(traceID, "mcp resources_list partial count=%d duration_ms=%d errors=%s", len(resources), time.Since(started).Milliseconds(), strings.Join(errs, "; "))
 		return resources, errors.New(strings.Join(errs, "; "))
 	}
+	manager.logger.Log(traceID, "mcp resources_list success count=%d duration_ms=%d", len(resources), time.Since(started).Milliseconds())
 	return resources, nil
 }
 
@@ -205,16 +212,28 @@ func (manager *MCPManager) ReadResource(ctx context.Context, server string, uri 
 	if manager == nil {
 		return "", errors.New("mcp manager is nil")
 	}
+	traceID := TraceIDFromContext(ctx)
+	started := time.Now()
 	manager.mu.Lock()
 	client := manager.clients[sanitizeMCPName(server)]
 	manager.mu.Unlock()
 	if client == nil {
+		manager.logger.Log(traceID, "mcp resource_read error server=%s uri=%s duration_ms=%d error=server_not_found", server, uri, time.Since(started).Milliseconds())
 		return "", fmt.Errorf("mcp server not found: %s", server)
 	}
-	return client.ReadResource(ctx, uri)
+	content, err := client.ReadResource(ctx, uri)
+	if err != nil {
+		manager.logger.Log(traceID, "mcp resource_read error server=%s uri=%s duration_ms=%d error=%v", server, uri, time.Since(started).Milliseconds(), err)
+		return content, err
+	}
+	manager.logger.Log(traceID, "mcp resource_read success server=%s uri=%s duration_ms=%d chars=%d", server, uri, time.Since(started).Milliseconds(), len(content))
+	return content, nil
 }
 
 func (client *MCPClient) Connect(ctx context.Context) error {
+	traceID := TraceIDFromContext(ctx)
+	started := time.Now()
+	client.logger.Log(traceID, "mcp server=%s connect_start transport=%s", client.config.Name, defaultString(client.config.Transport, "stdio"))
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	if client.transport != nil {
@@ -243,7 +262,20 @@ func (client *MCPClient) Connect(ctx context.Context) error {
 		return err
 	}
 	_ = client.refreshResourcesLocked(ctx)
+	client.logger.Log(traceID, "mcp server=%s connect_success duration_ms=%d tools=%d resources=%d", client.config.Name, time.Since(started).Milliseconds(), len(client.tools), len(client.resources))
 	return nil
+}
+
+func (client *MCPClient) ToolCount() int {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return len(client.tools)
+}
+
+func (client *MCPClient) ResourceCount() int {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return len(client.resources)
 }
 
 func (client *MCPClient) Close() error {
@@ -335,6 +367,8 @@ func (client *MCPClient) registerRemoteTools(registry *tool.Registry) {
 		registry.Unregister(name)
 		if err := registry.Register(&mcpRemoteTool{client: client, server: server, remote: remoteTool, name: name}); err != nil {
 			client.logger.Log("", "mcp server=%s register_tool_error remote=%s name=%s error=%v", server, remoteTool.Name, name, err)
+		} else {
+			client.logger.Log("", "mcp server=%s register_tool remote=%s name=%s", server, remoteTool.Name, name)
 		}
 	}
 }
@@ -449,14 +483,20 @@ func (tool *mcpRemoteTool) Call(input map[string]any) (string, error) {
 }
 
 func (tool *mcpRemoteTool) CallContext(ctx context.Context, input map[string]any) (string, error) {
+	traceID := TraceIDFromContext(ctx)
+	started := time.Now()
+	tool.client.logger.Log(traceID, "mcp_tool start server=%s remote=%s local=%s arg_keys=%s", tool.server, tool.remote.Name, tool.name, strings.Join(mapKeys(input), ","))
 	raw, err := tool.client.call(ctx, "tools/call", map[string]any{
 		"name":      tool.remote.Name,
 		"arguments": input,
 	})
 	if err != nil {
+		tool.client.logger.Log(traceID, "mcp_tool error server=%s remote=%s local=%s duration_ms=%d error=%v", tool.server, tool.remote.Name, tool.name, time.Since(started).Milliseconds(), err)
 		return "", err
 	}
-	return formatMCPToolResult(raw), nil
+	result := formatMCPToolResult(raw)
+	tool.client.logger.Log(traceID, "mcp_tool success server=%s remote=%s local=%s duration_ms=%d result_chars=%d", tool.server, tool.remote.Name, tool.name, time.Since(started).Milliseconds(), len(result))
+	return result, nil
 }
 
 type listMCPResourcesTool struct {
@@ -898,6 +938,13 @@ func sanitizeMCPName(value string) string {
 	value = strings.ReplaceAll(value, "-", "_")
 	value = mcpNamePattern.ReplaceAllString(value, "_")
 	return strings.Trim(value, "_")
+}
+
+func defaultString(value string, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func mcpToolName(server string, remoteTool string) string {
