@@ -33,6 +33,11 @@ install: build
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/$(BIN)"
+	rm -rf "$(APPDIR)"
+	rm -rf "$(HOME)/.codingman"
+	@echo "Removed $(DESTDIR)$(BINDIR)/$(BIN)"
+	@echo "Removed CodingMan app files from $(APPDIR)"
+	@echo "Removed all CodingMan user data from $(HOME)/.codingman"
 
 test:
 	$(GO) test ./...

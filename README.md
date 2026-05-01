@@ -43,6 +43,14 @@ make install PREFIX=$HOME/.local
 
 启动时配置加载顺序为：当前项目 `.env`、`~/.codingman/.env`、环境变量。安装时如果当前源码目录存在 `.env` 且用户级配置不存在，会自动初始化 `~/.codingman/.env`。
 
+卸载全局命令、应用文件和所有用户数据：
+
+```bash
+make uninstall
+```
+
+该命令会删除 `CM`、`~/.codingman/app` 和整个 `~/.codingman` 目录。
+
 常用验证：
 
 ```bash
