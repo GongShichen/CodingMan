@@ -43,6 +43,7 @@ go vet ./...
 - **Provider**：支持 OpenAI-compatible 和 Anthropic-compatible 模型接口；第三方 API 通过 `BASE_URL` 接入。
 - **工具系统**：内置 `read`、`write`、`edit`、`grep`、`glob`、`bash`、`websearch`，并支持并行安全分批执行；`write` / `edit` 成功后会在 TUI 中显示文件 diff。
 - **权限系统**：支持 `ask`、`allow-deny`、`full-auto` 三种模式；只读工具和安全 bash 命令可默认并行。
+- **macOS 沙箱**：`ask` 模式下可通过 Apple VF / vfkit 启动 Debian 12 slim VM，将 `bash`、写入、curl、Python/Node 脚本执行路由到 VM 内 MCP Server。
 - **上下文系统**：加载系统提示词、项目记忆、SKILL、会话记忆、跨会话记忆，并支持自动压缩。
 - **SKILL 系统**：支持用户级和项目级 SKILL，项目级同名覆盖用户级；每次真实执行前会用 LLM 从用户级 SKILL 中自动选择可用 SKILL，也可通过 `/skill use <name>` 手动激活运行时工具白名单。
 - **记忆自我进化**：复杂任务后自动审查对话，将可复用经验沉淀为用户级 SKILL；Agent 自沉淀的低频旧 SKILL 会按保守 LRU 策略淘汰。
@@ -227,6 +228,36 @@ using skill: go-testing - Go test debugging workflow
 ```
 
 失败的工具调用不会显示 diff。该能力用于让用户在 agent loop 中直接看到增删改，不改变工具返回给模型的内容。
+
+## macOS 沙箱
+
+沙箱暂时只支持 macOS arm64 + vfkit。首次启动会创建 `~/.codingman/sandbox/config`；之后每次 TUI 启动都会检查沙箱环境。若缺少 vfkit、VM MCP Server、cloud-init 配置或 Debian 12 slim arm64 raw 镜像，会说明必要性并询问是否安装/构建，用户确认后才执行。默认 `SANDBOX_ENABLED=auto` 表示 `permission=ask` 时启用；`full-auto` 会关闭沙箱，并要求显式确认风险。
+
+也可以手动构建 VM 内 MCP Server 与 rootfs：
+
+```bash
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o sandbox/mcp-server-linux-arm64 ./cmd/sandbox-mcp-server
+SANDBOX_ROOTFS=$PWD/sandbox/debian-12-slim-arm64.raw ./sandbox/build-rootfs.sh
+```
+
+运行时配置：
+
+```env
+SANDBOX_ENABLED=auto
+SANDBOX_ROOTFS=/path/to/debian-12-slim-arm64.raw
+SANDBOX_VFKIT=vfkit
+SANDBOX_KEEPALIVE_INTERVAL=30s
+SANDBOX_BOOTSTRAP=auto
+SANDBOX_MCP_SERVER=~/.codingman/sandbox/mcp-server-linux-arm64
+SANDBOX_EFI_VARIABLE_STORE=~/.codingman/sandbox/efi-variable-store
+SANDBOX_ROOTFS_SOURCE=/path/to/pre-downloaded/debian-12-genericcloud-arm64.raw
+DEBIAN_IMAGE_URLS=https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.raw|https://chuangtzu.ftp.acc.umu.se/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.raw
+DEBIAN_SHA512_URLS=https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS|https://chuangtzu.ftp.acc.umu.se/images/cloud/bookworm/latest/SHA512SUMS
+```
+
+Agent Core 通过本地 TCP proxy 连接 vfkit 暴露的 Unix socket，再经 vsock 到 VM。VM 内 `socat` 监听 vsock 8080 并转发到 `127.0.0.1:8080` 的 Go MCP Server；宿主侧每 30 秒调用 `/health` 保持链路活跃。
+
+`build-rootfs.sh` 会优先复用已有的 `.download` 临时文件并校验 SHA512；下载时按 `aria2c`、`wget`、`curl` 顺序尝试，并在多个 Debian 镜像源之间 fallback。若网络环境无法稳定访问 Debian 镜像源，可以先手动下载 `debian-12-genericcloud-arm64.raw`，再通过 `SANDBOX_ROOTFS_SOURCE` 指向本地文件。
 
 ## MCP 与 Hooks
 

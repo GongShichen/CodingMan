@@ -173,6 +173,32 @@ func (manager *PermissionManager) CheckWithResult(ctx context.Context, request P
 	}
 }
 
+func (manager *PermissionManager) AskLocalSandboxFallback(ctx context.Context, request PermissionRequest) (bool, error) {
+	if manager == nil {
+		return false, errors.New("permission manager is nil")
+	}
+	manager.mu.RLock()
+	askFunc := manager.askFunc
+	manager.mu.RUnlock()
+	if askFunc == nil {
+		return false, fmt.Errorf("permission denied: sandbox fallback for tool %s requires user approval", request.ToolName)
+	}
+	decision, reason, err := askFunc(ctx, request)
+	if err != nil {
+		return false, err
+	}
+	switch decision {
+	case PermissionDecisionAllow:
+		return true, nil
+	case PermissionDecisionDeny, PermissionDecisionDenyTool:
+		return false, permissionDenied(request.ToolName, reason)
+	case PermissionDecisionAllowTool, PermissionDecisionAllowRule:
+		return true, nil
+	default:
+		return false, fmt.Errorf("permission denied: invalid permission decision %q", decision)
+	}
+}
+
 func isParallelSafeRequest(request PermissionRequest, toolAllowed bool, allowedCommands []string, readonlyCommands []string) bool {
 	if toolAllowed {
 		return true

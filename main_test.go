@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +30,8 @@ func TestHandleSystemCommandLoadsPromptFile(t *testing.T) {
 
 func TestLoadRuntimeConfigDefaultsCwdToLaunchDir(t *testing.T) {
 	projectRoot := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SANDBOX_BOOTSTRAP", agent.SandboxBootstrapFalse)
 	launchDir := filepath.Join(projectRoot, "subdir")
 	if err := os.MkdirAll(launchDir, 0755); err != nil {
 		t.Fatal(err)
@@ -47,6 +51,65 @@ func TestLoadRuntimeConfigDefaultsCwdToLaunchDir(t *testing.T) {
 	}
 	if cfg.Context.Cwd != launchDir {
 		t.Fatalf("cwd should default to launch dir: got %q want %q", cfg.Context.Cwd, launchDir)
+	}
+}
+
+func TestLoadRuntimeConfigSetsSandboxEnvDefaults(t *testing.T) {
+	projectRoot := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SANDBOX_VFKIT", "")
+	t.Setenv("SANDBOX_ENABLED", "")
+	t.Setenv("SANDBOX_BOOTSTRAP", agent.SandboxBootstrapFalse)
+	env := strings.Join([]string{
+		"PROVIDER=OpenAI",
+		"MODEL_NAME=test-model",
+		"API_KEY=test-key",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(projectRoot, ".env"), []byte(env), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _, err := loadRuntimeConfig(projectRoot, projectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("SANDBOX_VFKIT") != "vfkit" {
+		t.Fatalf("SANDBOX_VFKIT default = %q", os.Getenv("SANDBOX_VFKIT"))
+	}
+	if cfg.Sandbox.VFKitPath != "vfkit" || cfg.Sandbox.Enabled != agent.SandboxEnabledAuto {
+		t.Fatalf("unexpected sandbox config: %+v", cfg.Sandbox)
+	}
+	configPath := filepath.Join(home, ".codingman", "sandbox", "config")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "SANDBOX_ROOTFS="+filepath.Join(home, ".codingman", "sandbox", "debian-12-slim-arm64.raw")) {
+		t.Fatalf("sandbox config missing rootfs default:\n%s", data)
+	}
+}
+
+func TestSandboxEnvironmentCheckReportsMissingRootFS(t *testing.T) {
+	check := checkSandboxEnvironment(t.TempDir(), agent.SandboxConfig{
+		Enabled:       agent.SandboxEnabledAuto,
+		Bootstrap:     agent.SandboxBootstrapAuto,
+		VFKitPath:     "vfkit",
+		RootFS:        filepath.Join(t.TempDir(), "missing-rootfs"),
+		MCPServerPath: filepath.Join(t.TempDir(), "missing-mcp"),
+	})
+	if !check.Needed {
+		t.Fatal("expected sandbox environment check to need setup")
+	}
+	summary := check.Summary()
+	if strings.Contains(strings.ToLower(summary), "docker") || strings.Contains(strings.ToLower(summary), "colima") {
+		t.Fatalf("sandbox check should not mention docker/colima:\n%s", summary)
+	}
+	if !strings.Contains(summary, "Debian 12 slim VM image") {
+		t.Fatalf("missing VM image setup item:\n%s", summary)
+	}
+	if strings.Contains(strings.ToLower(summary), "debootstrap") {
+		t.Fatalf("sandbox check should not mention debootstrap:\n%s", summary)
 	}
 }
 
@@ -109,6 +172,48 @@ func TestApplyCLIOptionsOverridesRuntimeConfig(t *testing.T) {
 	}
 	if cfg.MaxLLMTurns != 3 || cfg.MaxToolCalls != 4 {
 		t.Fatalf("limits not overridden: turns=%d tools=%d", cfg.MaxLLMTurns, cfg.MaxToolCalls)
+	}
+}
+
+func TestApplyCLIOptionsRequiresFullAutoConfirmationForNonInteractive(t *testing.T) {
+	cfg := RuntimeConfig{Context: agent.DefaultContextConfig()}
+	t.Setenv("CONFIRM_FULL_AUTO_UNSANDBOXED", "")
+	err := applyCLIOptions(&cfg, CLIOptions{NonInteractive: true, Permission: "full-auto"})
+	if err == nil {
+		t.Fatal("expected full-auto confirmation error")
+	}
+
+	t.Setenv("CONFIRM_FULL_AUTO_UNSANDBOXED", "true")
+	if err := applyCLIOptions(&cfg, CLIOptions{NonInteractive: true, Permission: "full-auto"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnableFullAutoUnsandboxedDisablesSandbox(t *testing.T) {
+	cfg := RuntimeConfig{
+		Permission: agent.PermissionConfig{Mode: agent.PermissionModeAsk},
+		Sandbox:    agent.SandboxConfig{Enabled: agent.SandboxEnabledAuto},
+	}
+	enableFullAutoUnsandboxed(&cfg)
+	if cfg.Permission.Mode != agent.PermissionModeFullAuto {
+		t.Fatalf("permission mode = %q", cfg.Permission.Mode)
+	}
+	if len(cfg.Permission.AllowedTools) != 1 || cfg.Permission.AllowedTools[0] != "*" {
+		t.Fatalf("allowed tools = %+v", cfg.Permission.AllowedTools)
+	}
+	if cfg.Sandbox.Enabled != agent.SandboxEnabledFalse {
+		t.Fatalf("sandbox enabled = %q", cfg.Sandbox.Enabled)
+	}
+}
+
+func TestConfirmFullAutoAfterSandboxFailure(t *testing.T) {
+	tui := newTUIController(bufio.NewScanner(strings.NewReader("1\n")))
+	if !tui.confirmFullAutoAfterSandboxFailure(errors.New("download failed")) {
+		t.Fatal("expected confirmation")
+	}
+	tui = newTUIController(bufio.NewScanner(strings.NewReader("no\n")))
+	if tui.confirmFullAutoAfterSandboxFailure(errors.New("download failed")) {
+		t.Fatal("expected cancellation")
 	}
 }
 

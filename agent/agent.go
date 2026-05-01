@@ -62,6 +62,7 @@ type Agent struct {
 	skillEvictionConfig       SkillEvictionConfig
 	retryConfig               RetryConfig
 	permission                *PermissionManager
+	sandbox                   *SandboxManager
 	promptCache               PromptCacheConfig
 	enableStreamRecovery      bool
 	streamRecoveryMaxRetries  int
@@ -101,6 +102,7 @@ type AgentConfig struct {
 	RetryConfig              RetryConfig
 	Permission               PermissionConfig
 	PermissionManager        *PermissionManager
+	Sandbox                  SandboxConfig
 	PromptCache              PromptCacheConfig
 	EnableStreamRecovery     *bool
 	StreamRecoveryMaxRetries int
@@ -222,6 +224,7 @@ func NewAgent(config AgentConfig) *Agent {
 		}
 		permissionManager = NewPermissionManager(permissionConfig)
 	}
+	sandbox := NewSandboxManager(config.Sandbox, contextConfig.Cwd, logger)
 	id := strings.TrimSpace(config.ID)
 	if id == "" {
 		id = "main"
@@ -273,6 +276,7 @@ func NewAgent(config AgentConfig) *Agent {
 		skillEvictionConfig:      normalizeSkillEvictionConfig(config.SkillEviction),
 		retryConfig:              defaultRetryConfig(config.RetryConfig),
 		permission:               permissionManager,
+		sandbox:                  sandbox,
 		promptCache:              normalizePromptCacheConfig(promptCacheConfig),
 		enableStreamRecovery:     defaultBool(config.EnableStreamRecovery, true),
 		streamRecoveryMaxRetries: defaultStreamRecoveryMaxRetries(config.StreamRecoveryMaxRetries, config.RetryConfig.MaxRetries),
@@ -288,6 +292,14 @@ func NewAgent(config AgentConfig) *Agent {
 	if mcpManager != nil {
 		agent.cleanup = append(agent.cleanup, mcpManager.Close)
 		mcpManager.Start(context.Background(), agent.registry)
+	}
+	if sandbox != nil {
+		agent.cleanup = append(agent.cleanup, sandbox.Close)
+		if permissionManager.Mode() == PermissionModeAsk && sandbox.config.Enabled != SandboxEnabledFalse {
+			if err := sandbox.Start(context.Background()); err != nil {
+				agent.log("", "sandbox startup_unavailable=%v", err)
+			}
+		}
 	}
 	agent.a2a.RegisterAgent(agent.id, agent.parentID)
 	if _, err := agent.MaybeEvictGeneratedSkills(time.Now().UTC()); err != nil {
@@ -428,6 +440,31 @@ func (agent *Agent) SetEventSink(sink func(AgentEvent)) {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 	agent.eventSink = sink
+}
+
+func (agent *Agent) StopSandbox() error {
+	agent.mu.Lock()
+	sandbox := agent.sandbox
+	agent.mu.Unlock()
+	if sandbox == nil {
+		return nil
+	}
+	return sandbox.Close()
+}
+
+func (agent *Agent) StartSandbox(ctx context.Context, config SandboxConfig) error {
+	agent.mu.Lock()
+	sandbox := agent.sandbox
+	if sandbox == nil {
+		sandbox = NewSandboxManager(config, agent.contextConfig.Cwd, agent.logger)
+		agent.sandbox = sandbox
+		agent.cleanup = append(agent.cleanup, sandbox.Close)
+	}
+	agent.mu.Unlock()
+	if err := sandbox.UpdateConfig(config); err != nil {
+		return err
+	}
+	return sandbox.Start(ctx)
 }
 
 func (agent *Agent) emitEvent(event AgentEvent) {
@@ -1853,6 +1890,7 @@ type preparedToolExecution struct {
 	name             string
 	input            map[string]any
 	parallelSafe     bool
+	sandboxRoute     bool
 	registry         *tool.Registry
 	enableToolBudget bool
 	toolBudget       ToolBudget
@@ -1883,6 +1921,7 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 	enableToolBudget := agent.enableToolBudget
 	toolBudget := agent.toolBudget
 	permission := agent.permission
+	sandbox := agent.sandbox
 	activeSkill := agent.activeSkill
 	skillRestriction := agent.skillToolRestriction
 	skillAllowedTools := copyStringSet(agent.skillAllowedTools)
@@ -1899,18 +1938,27 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 	}
 
 	permissionCheck := PermissionCheck{ParallelSafe: true}
+	sandboxRoute := false
+	if permission != nil && sandbox != nil {
+		sandboxRoute = sandbox.ShouldRoute(permission.Mode(), name, input)
+	}
 	if permission != nil {
 		agent.log(traceID, "tool_permission check name=%s id=%s", name, toolUseID)
-		check, err := permission.CheckWithResult(ctx, PermissionRequest{
-			ToolUseID: toolUseID,
-			ToolName:  name,
-			ToolInput: input,
-		})
-		if err != nil {
-			agent.log(traceID, "tool_permission denied name=%s id=%s error=%v", name, toolUseID, err)
-			return preparedToolExecution{}, err
+		if sandboxRoute {
+			permissionCheck = PermissionCheck{ParallelSafe: false}
+			agent.log(traceID, "tool_permission sandbox_route name=%s id=%s", name, toolUseID)
+		} else {
+			check, err := permission.CheckWithResult(ctx, PermissionRequest{
+				ToolUseID: toolUseID,
+				ToolName:  name,
+				ToolInput: input,
+			})
+			if err != nil {
+				agent.log(traceID, "tool_permission denied name=%s id=%s error=%v", name, toolUseID, err)
+				return preparedToolExecution{}, err
+			}
+			permissionCheck = check
 		}
-		permissionCheck = check
 		agent.log(traceID, "tool_permission allowed name=%s id=%s parallel_safe=%v", name, toolUseID, permissionCheck.ParallelSafe)
 	}
 
@@ -1924,6 +1972,7 @@ func (agent *Agent) prepareToolExecution(ctx context.Context, toolUse map[string
 		name:             name,
 		input:            input,
 		parallelSafe:     permissionCheck.ParallelSafe,
+		sandboxRoute:     sandboxRoute,
 		registry:         registry,
 		enableToolBudget: enableToolBudget,
 		toolBudget:       toolBudget,
@@ -2057,6 +2106,30 @@ func (agent *Agent) recordToolFileActivity(prepared preparedToolExecution) {
 }
 
 func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, error) {
+	if prepared.sandboxRoute {
+		result, err := agent.callSandboxTool(prepared)
+		if err == nil {
+			return agent.applyToolBudget(result, nil, prepared)
+		}
+		if !IsSandboxUnavailable(err) {
+			return result, err
+		}
+		agent.log(prepared.traceID, "sandbox unavailable tool=%s error=%v", prepared.name, err)
+		if agent.permission == nil {
+			return "", err
+		}
+		allowed, askErr := agent.permission.AskLocalSandboxFallback(prepared.ctx, PermissionRequest{
+			ToolUseID: prepared.toolUse.ID,
+			ToolName:  prepared.name,
+			ToolInput: withSandboxFallbackReason(prepared.input, err),
+		})
+		if askErr != nil {
+			return "", askErr
+		}
+		if !allowed {
+			return "", err
+		}
+	}
 	toolInstance, getErr := prepared.registry.Get(prepared.name)
 	if getErr != nil {
 		return "", getErr
@@ -2072,6 +2145,20 @@ func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, er
 			result, err = toolInstance.Call(prepared.input)
 		}
 	}
+	return agent.applyToolBudget(result, err, prepared)
+}
+
+func (agent *Agent) callSandboxTool(prepared preparedToolExecution) (string, error) {
+	agent.mu.Lock()
+	sandbox := agent.sandbox
+	agent.mu.Unlock()
+	if sandbox == nil {
+		return "", SandboxUnavailableError{Reason: "manager is nil"}
+	}
+	return sandbox.CallTool(prepared.ctx, prepared.name, prepared.input)
+}
+
+func (agent *Agent) applyToolBudget(result string, err error, prepared preparedToolExecution) (string, error) {
 	if prepared.enableToolBudget {
 		truncated, truncateErr := tool.TruncateToolResult(result, prepared.toolBudget.MaxLen, prepared.toolBudget.HeadLen, prepared.toolBudget.TailLen)
 		if truncateErr != nil && err == nil {
@@ -2082,6 +2169,16 @@ func (agent *Agent) callPreparedTool(prepared preparedToolExecution) (string, er
 		}
 	}
 	return result, err
+}
+
+func withSandboxFallbackReason(input map[string]any, err error) map[string]any {
+	copied := make(map[string]any, len(input)+2)
+	for key, value := range input {
+		copied[key] = value
+	}
+	copied["sandbox_fallback"] = true
+	copied["sandbox_error"] = err.Error()
+	return copied
 }
 
 type contextualTool interface {

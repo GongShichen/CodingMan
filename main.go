@@ -13,8 +13,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,6 +34,9 @@ const (
 	colorGreen = "\033[32m"
 	colorRed   = "\033[31m"
 	colorGray  = "\033[90m"
+
+	defaultDebianSandboxImageURL = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.raw"
+	debianSandboxImageName       = "debian-12-genericcloud-arm64.raw"
 )
 
 type RuntimeConfig struct {
@@ -60,6 +65,8 @@ type RuntimeConfig struct {
 	PromptCache             agent.PromptCacheConfig
 	Coordination            agent.CoordinationConfig
 	Permission              agent.PermissionConfig
+	Sandbox                 agent.SandboxConfig
+	SandboxCheck            SandboxEnvironmentCheck
 	Hooks                   *agent.HookManager
 	MCP                     agent.MCPConfig
 	LogPath                 string
@@ -88,6 +95,7 @@ func main() {
 	if err != nil {
 		fatal("find project root", err)
 	}
+	ensureVFKitDefaultPath()
 
 	cfg, source, err := loadRuntimeConfig(projectRoot, launchDir)
 	if err != nil {
@@ -95,6 +103,21 @@ func main() {
 	}
 	if err := applyCLIOptions(&cfg, options); err != nil {
 		fatal("apply args", err)
+	}
+	if options.NonInteractive && cfg.SandboxCheck.Needed {
+		fatal("sandbox environment check", fmt.Errorf("missing sandbox dependencies:\n%s\nrun CodingMan interactively to approve installation, or install them manually", cfg.SandboxCheck.Summary()))
+	}
+	var tui *tuiController
+	if !options.NonInteractive {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 1024), 1024*1024)
+		tui = newTUIController(scanner)
+		if err := tui.confirmAndInstallSandboxEnvironment(cfg.SandboxCheck); err != nil {
+			fmt.Fprintf(os.Stderr, "%ssandbox environment: %v%s\n", colorRed, err, colorReset)
+			if tui.confirmFullAutoAfterSandboxFailure(err) {
+				enableFullAutoUnsandboxed(&cfg)
+			}
+		}
 	}
 
 	client, err := agent.CreateLLM(agent.LLMConfig{
@@ -132,6 +155,7 @@ func main() {
 		ToolBudget:               cfg.ToolBudget,
 		RetryConfig:              cfg.Retry,
 		Permission:               cfg.Permission,
+		Sandbox:                  cfg.Sandbox,
 		PromptCache:              cfg.PromptCache,
 		Coordination:             cfg.Coordination,
 		Hooks:                    cfg.Hooks,
@@ -146,7 +170,7 @@ func main() {
 		}
 		return
 	}
-	RunTUI(a, cfg, source)
+	RunTUIWithController(a, cfg, source, tui)
 }
 
 func parseCLIOptions(args []string) (CLIOptions, error) {
@@ -197,6 +221,10 @@ func applyCLIOptions(cfg *RuntimeConfig, options CLIOptions) error {
 		}
 		cfg.Permission.Mode = mode
 		if mode == agent.PermissionModeFullAuto {
+			if options.NonInteractive && !boolValue(readProcessEnv(), "CONFIRM_FULL_AUTO_UNSANDBOXED", false) {
+				return errors.New("full-auto disables the sandbox; set CONFIRM_FULL_AUTO_UNSANDBOXED=true to confirm this risk in non-interactive mode")
+			}
+			fmt.Fprintln(os.Stderr, colorRed+"warning:"+colorReset+" full-auto disables the sandbox; dangerous operations may run on the local host")
 			cfg.Permission.AllowedTools = []string{"*"}
 		}
 	}
@@ -245,6 +273,15 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	tui := newTUIController(scanner)
+	RunTUIWithController(a, cfg, source, tui)
+}
+
+func RunTUIWithController(a *agent.Agent, cfg RuntimeConfig, source string, tui *tuiController) {
+	if tui == nil {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 1024), 1024*1024)
+		tui = newTUIController(scanner)
+	}
 	session := newSessionController(a, cfg.Context.Cwd)
 	if err := session.save(); err != nil {
 		fmt.Fprintf(os.Stderr, "%ssave session: %v%s\n", colorRed, err, colorReset)
@@ -261,14 +298,14 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 
 	for {
 		fmt.Printf("%s>%s ", colorCyan, colorReset)
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
+		if !tui.scanner.Scan() {
+			if err := tui.scanner.Err(); err != nil {
 				fmt.Fprintf(os.Stderr, "%sread input: %v%s\n", colorRed, err, colorReset)
 			}
 			return
 		}
 
-		prompt := strings.TrimSpace(scanner.Text())
+		prompt := strings.TrimSpace(tui.scanner.Text())
 		if prompt == "" {
 			continue
 		}
@@ -289,7 +326,7 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 			continue
 		}
 		if strings.HasPrefix(prompt, "/") {
-			if handled := handleSlashCommand(a, tui, session, prompt); handled {
+			if handled := handleSlashCommand(a, tui, session, &cfg, prompt); handled {
 				continue
 			}
 			fmt.Printf("%sunknown command:%s %s\n", colorRed, colorReset, prompt)
@@ -331,13 +368,13 @@ func RunTUI(a *agent.Agent, cfg RuntimeConfig, source string) {
 		if interrupted {
 			fmt.Println(colorDim + "interrupted. Add more context, or leave empty to skip." + colorReset)
 			fmt.Printf("%s+%s ", colorCyan, colorReset)
-			if !scanner.Scan() {
-				if err := scanner.Err(); err != nil {
+			if !tui.scanner.Scan() {
+				if err := tui.scanner.Err(); err != nil {
 					fmt.Fprintf(os.Stderr, "%sread input: %v%s\n", colorRed, err, colorReset)
 				}
 				return
 			}
-			followUp := strings.TrimSpace(scanner.Text())
+			followUp := strings.TrimSpace(tui.scanner.Text())
 			if followUp != "" {
 				resp, interrupted, err = tui.runAgent(a, followUp)
 				if err != nil {
@@ -472,7 +509,7 @@ func printHelp() {
 	fmt.Println()
 }
 
-func handleSlashCommand(a *agent.Agent, tui *tuiController, session *sessionController, prompt string) bool {
+func handleSlashCommand(a *agent.Agent, tui *tuiController, session *sessionController, cfg *RuntimeConfig, prompt string) bool {
 	fields := strings.Fields(prompt)
 	if len(fields) == 0 {
 		return false
@@ -504,9 +541,24 @@ func handleSlashCommand(a *agent.Agent, tui *tuiController, session *sessionCont
 			fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
 			return true
 		}
+		if mode == agent.PermissionModeFullAuto && !confirmFullAutoUnsandboxed(tui) {
+			fmt.Println(colorGray + "permission mode unchanged" + colorReset)
+			return true
+		}
+		if mode == agent.PermissionModeAsk && permissions.Mode() == agent.PermissionModeFullAuto {
+			if !prepareSandboxForAskMode(a, tui, cfg) {
+				fmt.Println(colorGray + "permission mode unchanged" + colorReset)
+				return true
+			}
+		}
 		if err := permissions.SetMode(mode); err != nil {
 			fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
 			return true
+		}
+		if mode == agent.PermissionModeFullAuto {
+			if err := a.StopSandbox(); err != nil {
+				fmt.Printf("%swarning:%s stop sandbox: %v\n", colorRed, colorReset, err)
+			}
 		}
 		fmt.Printf("%spermission mode:%s %s\n", colorGray, colorReset, mode)
 		return true
@@ -545,6 +597,112 @@ func handleSlashCommand(a *agent.Agent, tui *tuiController, session *sessionCont
 	default:
 		return false
 	}
+}
+
+func confirmFullAutoUnsandboxed(tui *tuiController) bool {
+	fmt.Println(colorRed + "warning:" + colorReset + " full-auto disables the sandbox; dangerous operations may run on the local host.")
+	fmt.Print(colorDim + "Type 1 to confirm, anything else to cancel > " + colorReset)
+	selection, err := tui.readSelection(context.Background())
+	if err != nil {
+		fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+		return false
+	}
+	return strings.TrimSpace(selection) == "1"
+}
+
+func prepareSandboxForAskMode(a *agent.Agent, tui *tuiController, cfg *RuntimeConfig) bool {
+	if cfg == nil {
+		fmt.Println(colorRed + "sandbox config is unavailable" + colorReset)
+		return false
+	}
+	sandboxConfig := cfg.Sandbox
+	sandboxConfig.Enabled = agent.SandboxEnabledAuto
+	projectRoot := cfg.Context.ProjectRoot
+	if strings.TrimSpace(projectRoot) == "" {
+		projectRoot = cfg.Context.Cwd
+	}
+	check := checkSandboxEnvironment(projectRoot, sandboxConfig)
+	if err := tui.confirmAndInstallSandboxEnvironment(check); err != nil {
+		fmt.Fprintf(os.Stderr, "%ssandbox environment: %v%s\n", colorRed, err, colorReset)
+		if tui.confirmFullAutoAfterSandboxFailure(err) {
+			enableFullAutoUnsandboxed(cfg)
+		}
+		return false
+	}
+	fmt.Println(colorGray + "starting sandbox for ask mode..." + colorReset)
+	if err := a.StartSandbox(context.Background(), sandboxConfig); err != nil {
+		fmt.Fprintf(os.Stderr, "%ssandbox start: %v%s\n", colorRed, err, colorReset)
+		if tui.confirmFullAutoAfterSandboxFailure(err) {
+			enableFullAutoUnsandboxed(cfg)
+		}
+		return false
+	}
+	cfg.Sandbox = sandboxConfig
+	fmt.Println(colorGreen + "sandbox ready; switching to ask mode" + colorReset)
+	return true
+}
+
+func (tui *tuiController) confirmFullAutoAfterSandboxFailure(reason error) bool {
+	fmt.Println(colorRed + "Sandbox is not ready." + colorReset)
+	if reason != nil {
+		fmt.Printf("Reason: %v\n", reason)
+	}
+	fmt.Println("Risk: switching to full-auto means bash, writes, curl, scripts, git mutations, and other dangerous operations may run directly on this Mac instead of inside the VM.")
+	fmt.Print(colorDim + "Switch to full-auto without sandbox? Type 1 to confirm, anything else to stay in ask mode > " + colorReset)
+	selection, err := tui.readSelection(context.Background())
+	if err != nil {
+		fmt.Printf("%serror:%s %v\n", colorRed, colorReset, err)
+		return false
+	}
+	return strings.TrimSpace(selection) == "1"
+}
+
+func enableFullAutoUnsandboxed(cfg *RuntimeConfig) {
+	if cfg == nil {
+		return
+	}
+	cfg.Permission.Mode = agent.PermissionModeFullAuto
+	cfg.Permission.AllowedTools = []string{"*"}
+	cfg.Sandbox.Enabled = agent.SandboxEnabledFalse
+	fmt.Println(colorRed + "warning:" + colorReset + " permission mode switched to full-auto; sandbox is disabled for this session.")
+}
+
+func (tui *tuiController) confirmAndInstallSandboxEnvironment(check SandboxEnvironmentCheck) error {
+	if !check.Needed {
+		return nil
+	}
+	fmt.Println(colorBold + "Sandbox environment check" + colorReset)
+	fmt.Println("CodingMan uses the sandbox to run bash and file writes inside a macOS Apple VF VM in ask mode.")
+	fmt.Println("The following required components are missing or incomplete:")
+	fmt.Println(check.Summary())
+	fmt.Print(colorDim + "Install/build these sandbox dependencies now? Type 1 to install, anything else to skip > " + colorReset)
+	selection, err := tui.readSelection(context.Background())
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(selection) != "1" {
+		return errors.New("user skipped sandbox dependency installation")
+	}
+	total := len(check.Items)
+	for i, item := range check.Items {
+		fmt.Printf("%s[%d/%d] preparing:%s %s\n", colorGray, i+1, total, colorReset, item.Name)
+		if strings.TrimSpace(item.Reason) != "" {
+			fmt.Printf("%s      reason:%s %s\n", colorGray, colorReset, item.Reason)
+		}
+		if item.InstallFunc == nil {
+			fmt.Printf("%s[%d/%d] skipped:%s %s has no installer\n", colorGray, i+1, total, colorReset, item.Name)
+			continue
+		}
+		start := time.Now()
+		fmt.Printf("%s[%d/%d] running:%s %s\n", colorGray, i+1, total, colorReset, item.Name)
+		if err := item.InstallFunc(); err != nil {
+			fmt.Printf("%s[%d/%d] failed:%s %s after %s\n", colorRed, i+1, total, colorReset, item.Name, time.Since(start).Round(time.Second))
+			return fmt.Errorf("%s: %w", item.Name, err)
+		}
+		fmt.Printf("%s[%d/%d] done:%s %s in %s\n", colorGreen, i+1, total, colorReset, item.Name, time.Since(start).Round(time.Second))
+	}
+	fmt.Println(colorGreen + "sandbox environment ready" + colorReset)
+	return nil
 }
 
 func handleSkillCommand(a *agent.Agent, fields []string) bool {
@@ -911,6 +1069,21 @@ func (tui *tuiController) permissionPrompt(ctx context.Context, request agent.Pe
 		fmt.Printf("%sid:%s %s\n", colorGray, colorReset, request.ToolUseID)
 	}
 	fmt.Printf("%sinput:%s\n%s\n", colorGray, colorReset, request.InputJSON())
+	if fallback, _ := request.ToolInput["sandbox_fallback"].(bool); fallback {
+		fmt.Println(colorRed + "Sandbox is unavailable. Allow this operation to run locally once?" + colorReset)
+		fmt.Println(colorDim + "Choose:" + colorReset)
+		fmt.Println("  1. Yes, allow local fallback once")
+		fmt.Println("  2. No, deny")
+		fmt.Print(colorDim + "Select option [1-2] > " + colorReset)
+		selection, err := tui.readSelection(ctx)
+		if err != nil {
+			return agent.PermissionDecisionDeny, "", err
+		}
+		if selection == "1" {
+			return agent.PermissionDecisionAllow, "", nil
+		}
+		return agent.PermissionDecisionDeny, "denied by user", nil
+	}
 	fmt.Println(colorDim + "Choose:" + colorReset)
 	fmt.Println("  1. Yes, allow once")
 	fmt.Println("  2. No, deny once")
@@ -1166,6 +1339,12 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 	} else {
 		values = readProcessEnv()
 	}
+	sandboxValues, err := ensureUserSandboxConfig()
+	if err != nil {
+		return RuntimeConfig{}, "", err
+	}
+	mergeSandboxConfigValues(values, sandboxValues)
+	applySandboxEnvDefaults(sandboxValues)
 
 	cfg := RuntimeConfig{
 		Provider:  strings.TrimSpace(values["PROVIDER"]),
@@ -1210,6 +1389,19 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 		EnableGitWorktree: boolValue(values, "WORKER_GIT_WORKTREE", false),
 		WorktreeBaseDir:   values["WORKER_WORKTREE_BASE_DIR"],
 	}
+	cfg.Sandbox = agent.SandboxConfig{
+		Enabled:           valueOrDefault(values["SANDBOX_ENABLED"], agent.SandboxEnabledAuto),
+		RootFS:            expandHome(values["SANDBOX_ROOTFS"]),
+		VFKitPath:         valueOrDefault(values["SANDBOX_VFKIT"], "vfkit"),
+		CPUs:              intValue(values, "SANDBOX_CPUS", 2),
+		Memory:            valueOrDefault(values["SANDBOX_MEMORY"], "2048M"),
+		KeepaliveInterval: durationValue(values, "SANDBOX_KEEPALIVE_INTERVAL", 30*time.Second),
+		SocketPath:        expandHome(values["SANDBOX_SOCKET_PATH"]),
+		Bootstrap:         valueOrDefault(values["SANDBOX_BOOTSTRAP"], agent.SandboxBootstrapAuto),
+		MCPServerPath:     expandHome(values["SANDBOX_MCP_SERVER"]),
+		EFIVariableStore:  expandHome(values["SANDBOX_EFI_VARIABLE_STORE"]),
+	}
+	cfg.SandboxCheck = checkSandboxEnvironment(projectRoot, cfg.Sandbox)
 	hooks, err := loadHooksConfig(projectRoot)
 	if err != nil {
 		return RuntimeConfig{}, "", err
@@ -1247,6 +1439,411 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 		return RuntimeConfig{}, "", err
 	}
 	return cfg, source, nil
+}
+
+func ensureUserSandboxConfig() (map[string]string, error) {
+	defaults, err := defaultUserSandboxConfig()
+	if err != nil {
+		return nil, err
+	}
+	configPath, err := userSandboxConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+			return nil, err
+		}
+		if err := writeSandboxConfig(configPath, defaults); err != nil {
+			return nil, err
+		}
+		return defaults, nil
+	} else if err != nil {
+		return nil, err
+	}
+	values, err := readDotEnv(configPath)
+	if err != nil {
+		return nil, err
+	}
+	changed := false
+	if migrated, ok := migrateLegacySandboxRootFS(values, defaults); ok {
+		values["SANDBOX_ROOTFS"] = migrated
+		changed = true
+	}
+	for key, value := range defaults {
+		if strings.TrimSpace(values[key]) == "" {
+			values[key] = value
+			changed = true
+		}
+	}
+	if changed {
+		if err := writeSandboxConfig(configPath, values); err != nil {
+			return nil, err
+		}
+	}
+	return values, nil
+}
+
+func migrateLegacySandboxRootFS(values map[string]string, defaults map[string]string) (string, bool) {
+	current := strings.TrimSpace(values["SANDBOX_ROOTFS"])
+	if current == "" {
+		return "", false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false
+	}
+	legacy := filepath.Join(home, ".codingman", "sandbox", "rootfs")
+	if expandHome(current) != legacy {
+		return "", false
+	}
+	if _, err := os.Stat(legacy); err == nil {
+		return "", false
+	}
+	return defaults["SANDBOX_ROOTFS"], true
+}
+
+func userSandboxConfigPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codingman", "sandbox", "config"), nil
+}
+
+func defaultUserSandboxConfig() (map[string]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{
+		"SANDBOX_ENABLED":               agent.SandboxEnabledAuto,
+		"SANDBOX_ROOTFS":                filepath.Join(home, ".codingman", "sandbox", "debian-12-slim-arm64.raw"),
+		"SANDBOX_VFKIT":                 "vfkit",
+		"SANDBOX_CPUS":                  "2",
+		"SANDBOX_MEMORY":                "2048M",
+		"SANDBOX_KEEPALIVE_INTERVAL":    "30s",
+		"SANDBOX_SOCKET_PATH":           "",
+		"SANDBOX_BOOTSTRAP":             agent.SandboxBootstrapAuto,
+		"SANDBOX_MCP_SERVER":            filepath.Join(home, ".codingman", "sandbox", "mcp-server-linux-arm64"),
+		"SANDBOX_EFI_VARIABLE_STORE":    filepath.Join(home, ".codingman", "sandbox", "efi-variable-store"),
+		"SANDBOX_ROOTFS_SOURCE":         "",
+		"DEBIAN_IMAGE_URLS":             defaultDebianSandboxImageURL + "|https://chuangtzu.ftp.acc.umu.se/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.raw|https://saimei.ftp.acc.umu.se/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.raw",
+		"DEBIAN_SHA512_URLS":            "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS|https://chuangtzu.ftp.acc.umu.se/images/cloud/bookworm/latest/SHA512SUMS|https://saimei.ftp.acc.umu.se/images/cloud/bookworm/latest/SHA512SUMS",
+		"CONFIRM_FULL_AUTO_UNSANDBOXED": "false",
+	}, nil
+}
+
+func writeSandboxConfig(path string, values map[string]string) error {
+	var builder strings.Builder
+	builder.WriteString("# CodingMan sandbox config\n")
+	for _, key := range sandboxConfigKeys() {
+		builder.WriteString(key)
+		builder.WriteString("=")
+		builder.WriteString(values[key])
+		builder.WriteString("\n")
+	}
+	return os.WriteFile(path, []byte(builder.String()), 0o600)
+}
+
+func sandboxConfigKeys() []string {
+	return []string{
+		"SANDBOX_ENABLED",
+		"SANDBOX_ROOTFS",
+		"SANDBOX_VFKIT",
+		"SANDBOX_CPUS",
+		"SANDBOX_MEMORY",
+		"SANDBOX_KEEPALIVE_INTERVAL",
+		"SANDBOX_SOCKET_PATH",
+		"SANDBOX_BOOTSTRAP",
+		"SANDBOX_MCP_SERVER",
+		"SANDBOX_EFI_VARIABLE_STORE",
+		"SANDBOX_ROOTFS_SOURCE",
+		"DEBIAN_IMAGE_URLS",
+		"DEBIAN_SHA512_URLS",
+		"CONFIRM_FULL_AUTO_UNSANDBOXED",
+	}
+}
+
+func mergeSandboxConfigValues(values map[string]string, sandboxValues map[string]string) {
+	for _, key := range sandboxConfigKeys() {
+		if strings.TrimSpace(values[key]) != "" {
+			continue
+		}
+		if envValue := strings.TrimSpace(os.Getenv(key)); envValue != "" {
+			values[key] = envValue
+			continue
+		}
+		values[key] = sandboxValues[key]
+	}
+}
+
+func applySandboxEnvDefaults(values map[string]string) {
+	for _, key := range sandboxConfigKeys() {
+		setDefaultEnv(key, values[key])
+	}
+}
+
+func ensureVFKitDefaultPath() {
+	if _, err := exec.LookPath("vfkit"); err == nil {
+		return
+	}
+	for _, dir := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
+		candidate := filepath.Join(dir, "vfkit")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			pathValue := os.Getenv("PATH")
+			if pathValue == "" {
+				_ = os.Setenv("PATH", dir)
+			} else {
+				_ = os.Setenv("PATH", dir+string(os.PathListSeparator)+pathValue)
+			}
+			return
+		}
+	}
+}
+
+func setDefaultEnv(key string, value string) {
+	if strings.TrimSpace(os.Getenv(key)) != "" {
+		return
+	}
+	_ = os.Setenv(key, value)
+}
+
+type SandboxEnvironmentCheck struct {
+	Needed bool
+	Items  []SandboxInstallItem
+}
+
+type SandboxInstallItem struct {
+	Name        string
+	Reason      string
+	InstallFunc func() error
+}
+
+func (check SandboxEnvironmentCheck) Summary() string {
+	if !check.Needed {
+		return "sandbox environment is ready"
+	}
+	lines := make([]string, 0, len(check.Items))
+	for _, item := range check.Items {
+		lines = append(lines, fmt.Sprintf("- %s: %s", item.Name, item.Reason))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func checkSandboxEnvironment(projectRoot string, config agent.SandboxConfig) SandboxEnvironmentCheck {
+	if !shouldBootstrapSandbox(config) || runtime.GOOS != "darwin" {
+		return SandboxEnvironmentCheck{}
+	}
+	var items []SandboxInstallItem
+	if _, err := exec.LookPath("brew"); err != nil {
+		items = append(items, SandboxInstallItem{
+			Name:   "Homebrew",
+			Reason: "needed to install vfkit when it is missing",
+			InstallFunc: func() error {
+				return errors.New("Homebrew is required; install it from https://brew.sh and restart CodingMan")
+			},
+		})
+	}
+	if _, err := exec.LookPath(config.VFKitPath); err != nil {
+		items = append(items, SandboxInstallItem{
+			Name:   "vfkit",
+			Reason: "required to start Apple Virtualization Framework VMs",
+			InstallFunc: func() error {
+				return runBrewInstall("vfkit")
+			},
+		})
+	}
+	mcpServer := config.MCPServerPath
+	if strings.TrimSpace(mcpServer) == "" {
+		values, err := defaultUserSandboxConfig()
+		if err != nil {
+			items = append(items, SandboxInstallItem{Name: "sandbox config", Reason: err.Error(), InstallFunc: func() error { return err }})
+			return SandboxEnvironmentCheck{Needed: true, Items: items}
+		}
+		mcpServer = values["SANDBOX_MCP_SERVER"]
+	}
+	if _, err := os.Stat(mcpServer); err != nil {
+		items = append(items, SandboxInstallItem{
+			Name:   "sandbox MCP server",
+			Reason: "required inside the VM to expose bash/file/grep MCP tools",
+			InstallFunc: func() error {
+				return buildSandboxMCPServer(projectRoot, mcpServer)
+			},
+		})
+	}
+	needsImageBuild := false
+	if _, err := os.Stat(config.RootFS); err == nil {
+		if cloudInitReady(config.RootFS) && sandboxImageSourceReady(config.RootFS) {
+			return SandboxEnvironmentCheck{Needed: len(items) > 0, Items: items}
+		}
+		needsImageBuild = true
+	} else if err != nil && !os.IsNotExist(err) {
+		items = append(items, SandboxInstallItem{Name: "sandbox rootfs", Reason: err.Error(), InstallFunc: func() error { return err }})
+		return SandboxEnvironmentCheck{Needed: true, Items: items}
+	} else {
+		needsImageBuild = true
+	}
+	if needsImageBuild {
+		if _, err := exec.LookPath("aria2c"); err != nil {
+			items = append(items, SandboxInstallItem{
+				Name:   "aria2",
+				Reason: "recommended downloader for resilient multi-connection Debian image downloads",
+				InstallFunc: func() error {
+					return runBrewInstall("aria2")
+				},
+			})
+		}
+		if _, err := os.Stat(config.RootFS); err == nil {
+			items = append(items, SandboxInstallItem{
+				Name:   "sandbox cloud-init/image metadata",
+				Reason: "required to provision the Debian 12 slim VM and confirm the default genericcloud image source",
+				InstallFunc: func() error {
+					return buildSandboxRootFS(projectRoot, config.RootFS, mcpServer)
+				},
+			})
+			return SandboxEnvironmentCheck{Needed: len(items) > 0, Items: items}
+		}
+	}
+	items = append(items, SandboxInstallItem{
+		Name:   "Debian 12 slim VM image",
+		Reason: "required bootable arm64 raw disk for Apple VF sandbox execution",
+		InstallFunc: func() error {
+			return buildSandboxRootFS(projectRoot, config.RootFS, mcpServer)
+		},
+	})
+	return SandboxEnvironmentCheck{Needed: len(items) > 0, Items: items}
+}
+
+func cloudInitReady(rootfs string) bool {
+	dir := sandboxCloudInitDir(rootfs)
+	for _, name := range []string{"user-data", "meta-data"} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || info.IsDir() || info.Size() == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func sandboxImageSourceReady(rootfs string) bool {
+	defaults, err := defaultUserSandboxConfig()
+	if err != nil {
+		return true
+	}
+	if expandHome(rootfs) != defaults["SANDBOX_ROOTFS"] {
+		return true
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(rootfs), "image-url"))
+	if err != nil {
+		return false
+	}
+	imageURL := strings.TrimSpace(string(data))
+	if imageURL == defaultDebianSandboxImageURL {
+		return true
+	}
+	for _, configuredURL := range strings.Split(os.Getenv("DEBIAN_IMAGE_URLS"), "|") {
+		if imageURL == strings.TrimSpace(configuredURL) {
+			return true
+		}
+	}
+	parsed, err := url.Parse(imageURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(filepath.Base(parsed.Path), debianSandboxImageName)
+}
+
+func sandboxCloudInitDir(rootfs string) string {
+	if strings.TrimSpace(rootfs) == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(rootfs), "cloud-init")
+}
+
+func shouldBootstrapSandbox(config agent.SandboxConfig) bool {
+	if config.Enabled == agent.SandboxEnabledFalse {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(config.Bootstrap)) {
+	case "", agent.SandboxBootstrapAuto, agent.SandboxBootstrapTrue:
+		return true
+	case agent.SandboxBootstrapFalse:
+		return false
+	default:
+		return true
+	}
+}
+
+func ensureHostCommand(command string, brewPackage string, brewArgs []string) error {
+	if strings.TrimSpace(command) == "" {
+		return errors.New("command name is required")
+	}
+	if _, err := exec.LookPath(command); err == nil {
+		return nil
+	}
+	if len(brewArgs) == 0 {
+		return fmt.Errorf("%s not found in PATH", command)
+	}
+	brew, err := exec.LookPath("brew")
+	if err != nil {
+		return fmt.Errorf("%s not found and Homebrew is unavailable", command)
+	}
+	cmd := exec.Command(brew, brewArgs...)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if brewPackage != "" {
+			return fmt.Errorf("install %s: %w", brewPackage, err)
+		}
+		return err
+	}
+	if _, err := exec.LookPath(command); err != nil {
+		return fmt.Errorf("%s still not found after install", command)
+	}
+	return nil
+}
+
+func runBrewInstall(pkg string) error {
+	brew, err := exec.LookPath("brew")
+	if err != nil {
+		return fmt.Errorf("Homebrew is unavailable: %w", err)
+	}
+	cmd := exec.Command(brew, "install", pkg)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func buildSandboxMCPServer(projectRoot string, output string) error {
+	if strings.TrimSpace(output) == "" {
+		return errors.New("SANDBOX_MCP_SERVER is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
+		return err
+	}
+	cmd := exec.Command("go", "build", "-o", output, "./cmd/sandbox-mcp-server")
+	cmd.Dir = projectRoot
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func buildSandboxRootFS(projectRoot string, rootfs string, mcpServer string) error {
+	if strings.TrimSpace(rootfs) == "" {
+		return errors.New("SANDBOX_ROOTFS is required")
+	}
+	script := filepath.Join(projectRoot, "sandbox", "build-rootfs.sh")
+	if _, err := os.Stat(script); err != nil {
+		return err
+	}
+	cmd := exec.Command(script)
+	cmd.Dir = projectRoot
+	cmd.Env = append(os.Environ(), "ROOTFS_IMAGE="+rootfs, "MCP_SERVER="+mcpServer)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func validateRuntimeConfig(cfg RuntimeConfig) error {
