@@ -45,7 +45,7 @@ func TestLoadRuntimeConfigDefaultsCwdToLaunchDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, _, err := loadRuntimeConfig(projectRoot, launchDir)
+	cfg, _, err := loadRuntimeConfig(projectRoot, projectRoot, launchDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestLoadRuntimeConfigSetsSandboxEnvDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, _, err := loadRuntimeConfig(projectRoot, projectRoot)
+	cfg, _, err := loadRuntimeConfig(projectRoot, projectRoot, projectRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +87,63 @@ func TestLoadRuntimeConfigSetsSandboxEnvDefaults(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "SANDBOX_ROOTFS="+filepath.Join(home, ".codingman", "sandbox", "debian-12-slim-arm64.raw")) {
 		t.Fatalf("sandbox config missing rootfs default:\n%s", data)
+	}
+}
+
+func TestLoadRuntimeConfigFallsBackToUserEnv(t *testing.T) {
+	appRoot := t.TempDir()
+	workspaceRoot := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SANDBOX_BOOTSTRAP", agent.SandboxBootstrapFalse)
+	userConfigDir := filepath.Join(home, ".codingman")
+	if err := os.MkdirAll(userConfigDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	env := strings.Join([]string{
+		"PROVIDER=OpenAI",
+		"MODEL_NAME=user-model",
+		"API_KEY=user-key",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(userConfigDir, ".env"), []byte(env), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, source, err := loadRuntimeConfig(appRoot, workspaceRoot, workspaceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(source, filepath.Join(".codingman", ".env")) {
+		t.Fatalf("expected user env source, got %q", source)
+	}
+	if cfg.ModelName != "user-model" || cfg.APIKey != "user-key" {
+		t.Fatalf("unexpected config from user env: %+v", cfg)
+	}
+}
+
+func TestResolveAppRootUsesConfiguredRoot(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{
+		"go.mod",
+		"main.go",
+		filepath.Join("sandbox", "build-rootfs.sh"),
+		filepath.Join("cmd", "sandbox-mcp-server", "main.go"),
+	} {
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CODINGMAN_APP_ROOT", root)
+	resolved, err := resolveAppRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != root {
+		t.Fatalf("resolved app root = %q, want %q", resolved, root)
 	}
 }
 

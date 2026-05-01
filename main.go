@@ -39,6 +39,8 @@ const (
 	debianSandboxImageName       = "debian-12-genericcloud-arm64.raw"
 )
 
+var defaultAppRoot string
+
 type RuntimeConfig struct {
 	Provider  string
 	ModelName string
@@ -91,13 +93,14 @@ func main() {
 	if err != nil {
 		fatal("get working directory", err)
 	}
-	projectRoot, err := findProjectRoot(".")
+	appRoot, err := resolveAppRoot(".")
 	if err != nil {
-		fatal("find project root", err)
+		fatal("find app root", err)
 	}
+	workspaceRoot := findMemoryProjectRoot(launchDir)
 	ensureVFKitDefaultPath()
 
-	cfg, source, err := loadRuntimeConfig(projectRoot, launchDir)
+	cfg, source, err := loadRuntimeConfig(appRoot, workspaceRoot, launchDir)
 	if err != nil {
 		fatal("load config", err)
 	}
@@ -1322,20 +1325,20 @@ func expandHome(path string) string {
 	return path
 }
 
-func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, string, error) {
-	envPath := filepath.Join(projectRoot, ".env")
+func loadRuntimeConfig(appRoot string, workspaceRoot string, launchDir string) (RuntimeConfig, string, error) {
 	values := map[string]string{}
 	source := "environment"
 
-	if _, err := os.Stat(envPath); err == nil {
-		loaded, err := readDotEnv(envPath)
+	envPath, err := firstExistingEnvFile(workspaceRoot)
+	if err != nil {
+		return RuntimeConfig{}, "", err
+	}
+	if envPath != "" {
+		values, err = readDotEnv(envPath)
 		if err != nil {
 			return RuntimeConfig{}, "", err
 		}
-		values = loaded
 		source = envPath
-	} else if !os.IsNotExist(err) {
-		return RuntimeConfig{}, "", err
 	} else {
 		values = readProcessEnv()
 	}
@@ -1354,7 +1357,7 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 		Context:   agent.DefaultContextConfig(),
 	}
 	cfg.Context.Cwd = valueOrDefault(values["CWD"], launchDir)
-	cfg.Context.ProjectRoot = valueOrDefault(values["PROJECT_ROOT"], findMemoryProjectRoot(cfg.Context.Cwd))
+	cfg.Context.ProjectRoot = valueOrDefault(values["PROJECT_ROOT"], workspaceRoot)
 	cfg.Context.BaseSystem = values["BASE_SYSTEM"]
 	cfg.Context.IncludeDate = boolValue(values, "INCLUDE_DATE", cfg.Context.IncludeDate)
 	cfg.Context.LoadAgentsMD = boolValue(values, "LOAD_AGENTS_MD", cfg.Context.LoadAgentsMD)
@@ -1401,13 +1404,13 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 		MCPServerPath:     expandHome(values["SANDBOX_MCP_SERVER"]),
 		EFIVariableStore:  expandHome(values["SANDBOX_EFI_VARIABLE_STORE"]),
 	}
-	cfg.SandboxCheck = checkSandboxEnvironment(projectRoot, cfg.Sandbox)
-	hooks, err := loadHooksConfig(projectRoot)
+	cfg.SandboxCheck = checkSandboxEnvironment(appRoot, cfg.Sandbox)
+	hooks, err := loadHooksConfig(workspaceRoot)
 	if err != nil {
 		return RuntimeConfig{}, "", err
 	}
 	cfg.Hooks = hooks
-	mcp, err := loadMCPConfig(projectRoot)
+	mcp, err := loadMCPConfig(workspaceRoot)
 	if err != nil {
 		return RuntimeConfig{}, "", err
 	}
@@ -1433,12 +1436,30 @@ func loadRuntimeConfig(projectRoot string, launchDir string) (RuntimeConfig, str
 		Retention: valueOrDefault(values["PROMPT_CACHE_RETENTION"], agent.PromptCacheRetentionInMemory),
 		TTL:       valueOrDefault(values["PROMPT_CACHE_TTL"], agent.PromptCacheTTL5m),
 	}
-	cfg.LogPath = valueOrDefault(values["LOG_PATH"], filepath.Join(projectRoot, ".codingman.log"))
+	cfg.LogPath = valueOrDefault(values["LOG_PATH"], filepath.Join(workspaceRoot, ".codingman.log"))
 
 	if err := validateRuntimeConfig(cfg); err != nil {
 		return RuntimeConfig{}, "", err
 	}
 	return cfg, source, nil
+}
+
+func firstExistingEnvFile(workspaceRoot string) (string, error) {
+	candidates := []string{}
+	if strings.TrimSpace(workspaceRoot) != "" {
+		candidates = append(candidates, filepath.Join(workspaceRoot, ".env"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".codingman", ".env"))
+	}
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return "", nil
 }
 
 func ensureUserSandboxConfig() (map[string]string, error) {
@@ -2002,6 +2023,57 @@ func findProjectRoot(start string) (string, error) {
 		}
 		current = parent
 	}
+}
+
+func resolveAppRoot(start string) (string, error) {
+	candidates := []string{
+		os.Getenv("CODINGMAN_APP_ROOT"),
+		defaultAppRoot,
+	}
+	if root, err := findProjectRoot(start); err == nil {
+		candidates = append(candidates, root)
+	}
+	if exe, err := os.Executable(); err == nil {
+		if root, err := findProjectRoot(filepath.Dir(exe)); err == nil {
+			candidates = append(candidates, root)
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".codingman", "app"))
+	}
+	for _, candidate := range candidates {
+		root := expandHome(strings.TrimSpace(candidate))
+		if root == "" {
+			continue
+		}
+		if isCodingManAppRoot(root) {
+			abs, err := filepath.Abs(root)
+			if err != nil {
+				return "", err
+			}
+			return abs, nil
+		}
+	}
+	return "", errors.New("CodingMan app root not found; set CODINGMAN_APP_ROOT or run `make install` from the source tree")
+}
+
+func isCodingManAppRoot(root string) bool {
+	if root == "" {
+		return false
+	}
+	required := []string{
+		filepath.Join(root, "go.mod"),
+		filepath.Join(root, "main.go"),
+		filepath.Join(root, "sandbox", "build-rootfs.sh"),
+		filepath.Join(root, "cmd", "sandbox-mcp-server", "main.go"),
+	}
+	for _, path := range required {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
 }
 
 func findMemoryProjectRoot(start string) string {

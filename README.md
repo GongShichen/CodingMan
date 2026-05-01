@@ -29,6 +29,20 @@ BASE_URL=
 go run .
 ```
 
+安装全局命令：
+
+```bash
+make install
+```
+
+安装后可在任意目录使用 `CM` 启动 CodingMan。默认会把可执行文件安装到 `/usr/local/bin/CM`，并把运行所需文件同步到 `~/.codingman/app`。如果没有 `/usr/local/bin` 写权限，可以指定用户目录：
+
+```bash
+make install PREFIX=$HOME/.local
+```
+
+启动时配置加载顺序为：当前项目 `.env`、`~/.codingman/.env`、环境变量。安装时如果当前源码目录存在 `.env` 且用户级配置不存在，会自动初始化 `~/.codingman/.env`。
+
 常用验证：
 
 ```bash
